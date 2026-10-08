@@ -198,3 +198,35 @@ export class AuthError extends Error {
     this.name = 'AuthError'
   }
 }
+
+/**
+ * The jobs worth a row of their own: whatever is running, failed (allowed failures too),
+ * blocked, cancelled-out-of-reach or unknown, and manual jobs that hold the pipeline.
+ * Passed, pending, skipped and optional manual jobs are only counted.
+ */
+export function jobsNeedingAttention(jobs: readonly MergeWatchJob[]): MergeWatchJob[] {
+  return jobs.filter(
+    j =>
+      j.state === 'failed' ||
+      j.state === 'running' ||
+      j.state === 'blocked' ||
+      j.state === 'unknown' ||
+      j.state === 'unavailable' ||
+      (j.state === 'manual' && j.label.includes('blocking')),
+  )
+}
+
+const COUNT_ORDER: readonly MergeWatchCiState[] = ['passed', 'warning', 'failed', 'running', 'pending', 'manual', 'blocked', 'skipped', 'cancelled', 'unknown', 'unavailable']
+
+/** "26 passed · 1 failed · 3 pending": every job counted, in a fixed order, zeros left out. */
+export function jobCounts(jobs: readonly MergeWatchJob[]): string {
+  const counts = new Map<MergeWatchCiState, number>()
+
+  for (const j of jobs) {
+    counts.set(j.state, (counts.get(j.state) ?? 0) + 1)
+  }
+
+  return COUNT_ORDER.filter(s => (counts.get(s) ?? 0) > 0)
+    .map(s => `${counts.get(s)} ${STATE_WORD[s].toLowerCase()}`)
+    .join(' · ')
+}

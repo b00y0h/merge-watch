@@ -8,19 +8,20 @@ CI/CD job, refreshed once a minute.
 Merge Watch · team/my-project
 3 open MRs · Updated 14:32:05
 [ Refresh ] [ Hide ]
-
-▾ !142 Add the pricing page          ▶ Running
-  Open · Awaiting review
-  · Not ready to merge · Needs approval
-  pricing-page → main · by alex
-  Pipeline #830                       ▶ Running
-    ✓ lint                              Passed
-    ▶ build                             Running
-    ○ deploy preview                    Pending
+▾ !142 Add the pricing page                         ▶ Running
+  Open · Awaiting review · Not ready to merge · Needs approval
+  pricing-page → main · by alex  copy link
+  Pipeline #830 · 2 passed · 1 running · 1 pending  ▶ Running
+    ▶ build                                           Running
+▸ !139 Fix checkout validation                      ✕ Failed
+  Open · Changes requested · Not ready to merge
 ```
 
 - Click a request's title to open it in your browser. Click a job to open that job.
 - The ▾/▸ arrow beside a title collapses or expands its jobs. Your choice is remembered per repository.
+- Only jobs that need a look get a row of their own: running, failed (allowed failures included, and
+  labelled), blocked, unknown, and manual jobs that block the pipeline. Every other job is counted on
+  the pipeline's line ("26 passed · 1 failed · 3 pending"), so a collapsed request takes two lines.
 - Every status has an icon and a word: Passed, Failed, Running, Pending, Manual, Blocked, Skipped,
   Cancelled, No pipeline, No checks, Unknown, Unavailable.
 - Readiness ("Ready to merge", blockers such as merge conflicts) is shown apart from CI. Passing CI

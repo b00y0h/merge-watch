@@ -17,7 +17,7 @@ import { fetchGitLab } from './gitlab'
 import { chooseRepo, reposFromRemotes, splitHosts } from './repo'
 import type { HostConfig } from './repo'
 import { cleanError } from './safe'
-import { AuthError, RateLimitError, STATE_COLOR, STATE_ICON, sortRequests } from './status'
+import { AuthError, RateLimitError, STATE_COLOR, STATE_ICON, jobCounts, jobsNeedingAttention, sortRequests } from './status'
 
 type $ = EngineInterface
 
@@ -580,7 +580,9 @@ export function registerMergeWatch(on: On, options: PluginOptions): void {
     const view = await read($, viewAtom)
     const snapshot = await read($, snapshotAtom)
     const expanded = await read($, expandedAtom)
-    const width = Math.max(24, e.props.bodyColumns)
+    const columns = Number(e.props.bodyColumns)
+    // Some surfaces may not report a width; let them lay the pane out themselves.
+    const width = Number.isFinite(columns) && columns > 0 ? Math.max(24, columns) : undefined
     const repo = view.repo
     const data = snapshot !== null && repo !== null && snapshot.repoKey === repo.key ? snapshot : null
 
@@ -706,32 +708,32 @@ export function registerMergeWatch(on: On, options: PluginOptions): void {
       </Box>
     )
 
+    // Two lines per request when collapsed; expanded adds the branch line, one summary line per
+    // pipeline, and a row only for the jobs that need a look (running, failed, blocked, unknown).
     function renderRequest(r: MergeWatchRequest, isOpen: boolean, fetchedAt: number | null): RenderElement[] {
       const k = `r-${r.key}`
       const isStale = r.staleSince !== null
+      const isReady = r.readiness === 'Ready to merge'
       const ciText = `${STATE_ICON[r.ci.state]} ${r.ci.label}${isStale ? ' (stale)' : ''}`
+      const statusLine = [r.isDraft ? 'Draft' : 'Open', r.review, `${isReady ? '✓ ' : ''}${r.readiness}`, ...r.blockers].join(' · ')
       const out: RenderElement[] = [
-        <Box key={`${k}-head`} flexDirection="row" justifyContent="space-between" columnGap={1} marginTop={1}>
+        <Box key={`${k}-head`} flexDirection="row" justifyContent="space-between" columnGap={1}>
           <Box flexDirection="row" flexShrink={1} columnGap={1}>
             <Button key={`toggle-${r.key}`} plain label={isOpen ? '▾' : '▸'} onPress={() => toggleExpanded($, r.key)} />
             {r.url === null ? (
               <Text bold wrap="truncate-end">{`${r.ref} ${r.title} (no link)`}</Text>
             ) : (
-              <Link key={`link-${r.key}`} href={r.url} label={`${r.ref} ${r.title}`} />
+              <Text wrap="truncate-end">
+                <Link key={`link-${r.key}`} href={r.url} label={`${r.ref} ${r.title}`} />
+              </Text>
             )}
           </Box>
           <Text color={isStale ? 'warning' : STATE_COLOR[r.ci.state]} wrap="truncate-end">
             {ciText}
           </Text>
         </Box>,
-        <Text key={`${k}-review`} dimColor wrap="truncate-end">
-          {`  ${r.isDraft ? 'Draft' : 'Open'} · ${r.review}`}
-        </Text>,
-        <Text key={`${k}-ready`} wrap="truncate-end" color={r.readiness === 'Ready to merge' ? 'success' : undefined}>
-          {`  ${r.readiness === 'Ready to merge' ? '✓' : '·'} ${r.readiness}${r.blockers.length > 0 ? ` · ${r.blockers.join(' · ')}` : ''}`}
-        </Text>,
-        <Text key={`${k}-branch`} dimColor wrap="truncate-end">
-          {`  ${r.sourceBranch} → ${r.targetBranch} · by ${r.author}${r.sourceProject === null ? '' : ` · from ${r.sourceProject}`}`}
+        <Text key={`${k}-status`} dimColor={!isReady} color={isReady ? 'success' : undefined} wrap="truncate-end">
+          {`  ${statusLine}`}
         </Text>,
       ]
 
@@ -751,18 +753,19 @@ export function registerMergeWatch(on: On, options: PluginOptions): void {
         )
       }
 
-      if (r.url !== null) {
-        const url = r.url
-        out.push(
-          <Box key={`${k}-copy`} paddingLeft={2}>
-            <Button key={`copy-${r.key}`} plain dimColor label="Copy link" onPress={press => copyLink($, url, press.surface)} />
-          </Box>,
-        )
-      }
-
       if (!isOpen) {
         return out
       }
+
+      const url = r.url
+      out.push(
+        <Box key={`${k}-branch`} flexDirection="row" columnGap={1}>
+          <Text dimColor wrap="truncate-end">
+            {`  ${r.sourceBranch} → ${r.targetBranch} · by ${r.author}${r.sourceProject === null ? '' : ` · from ${r.sourceProject}`}`}
+          </Text>
+          {url !== null && <Button key={`copy-${r.key}`} plain dimColor label="copy link" onPress={press => copyLink($, url, press.surface)} />}
+        </Box>,
+      )
 
       if (r.ci.pipelines.length === 0) {
         out.push(
@@ -780,11 +783,15 @@ export function registerMergeWatch(on: On, options: PluginOptions): void {
     function renderPipeline(p: MergeWatchPipeline, k: string, indent: number): RenderElement[] {
       const pad = ' '.repeat(indent)
       const state = p.isPreviousRevision ? 'Previous revision' : p.label
+      const counts = jobCounts(p.jobs)
       const out: RenderElement[] = [
         <Box key={`${k}-head`} flexDirection="row" justifyContent="space-between" columnGap={1}>
           <Box flexDirection="row" flexShrink={1}>
             <Text>{pad}</Text>
-            {p.url === null ? <Text wrap="truncate-end">{p.title}</Text> : <Link key={`${k}-link`} href={p.url} label={p.title} />}
+            <Text wrap="truncate-end">
+              {p.url === null ? p.title : <Link key={`${k}-link`} href={p.url} label={p.title} />}
+              {counts === '' ? '' : ` · ${counts}`}
+            </Text>
           </Box>
           <Text color={p.isPreviousRevision ? 'warning' : STATE_COLOR[p.state]} wrap="truncate-end">
             {`${p.isPreviousRevision ? '↺' : STATE_ICON[p.state]} ${state}`}
@@ -794,7 +801,7 @@ export function registerMergeWatch(on: On, options: PluginOptions): void {
 
       p.notes.forEach((note, i) =>
         out.push(
-          <Text key={`${k}-n${i}`} dimColor color={note.startsWith('Previous revision') ? 'warning' : undefined} wrap="wrap">
+          <Text key={`${k}-n${i}`} dimColor color={note.startsWith('Previous revision') ? 'warning' : undefined} wrap="truncate-end">
             {`${pad}  ${note}`}
           </Text>,
         ),
@@ -808,16 +815,12 @@ export function registerMergeWatch(on: On, options: PluginOptions): void {
         )
       }
 
-      p.jobs.forEach(j => {
+      jobsNeedingAttention(p.jobs).forEach(j => {
         out.push(
           <Box key={`${k}-j${j.id}`} flexDirection="row" justifyContent="space-between" columnGap={1}>
             <Box flexDirection="row" flexShrink={1}>
               <Text color={STATE_COLOR[j.state]}>{`${pad}  ${STATE_ICON[j.state]} `}</Text>
-              {j.url === null ? (
-                <Text wrap="truncate-end">{`${j.name} (no link)`}</Text>
-              ) : (
-                <Link key={`job-${j.id}`} href={j.url} label={j.name} />
-              )}
+              <Text wrap="truncate-end">{j.url === null ? `${j.name} (no link)` : <Link key={`job-${j.id}`} href={j.url} label={j.name} />}</Text>
             </Box>
             <Text color={STATE_COLOR[j.state]} wrap="truncate-end">
               {j.label}
@@ -830,5 +833,17 @@ export function registerMergeWatch(on: On, options: PluginOptions): void {
 
       return out
     }
+  }).catch(($, e, next) => {
+    // A drawing that fails says so in the pane instead of leaving it blank.
+    const { Box, Text } = $.ui.resolve(e)
+
+    return (
+      <Box flexDirection="column">
+        <Text bold>Merge Watch</Text>
+        <Text color="warning" wrap="wrap">
+          {`! The panel could not be drawn: ${cleanError(next.error?.message ?? 'unknown error')}. Run /merge-watch refresh to try again.`}
+        </Text>
+      </Box>
+    )
   })
 }

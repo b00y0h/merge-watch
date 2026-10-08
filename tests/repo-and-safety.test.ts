@@ -2,6 +2,7 @@ import { expect, test } from 'claude-code/testing'
 
 import { chooseRepo, parseRemoteUrl, providerFor, reposFromRemotes, repoKey } from '../hooks/repo'
 import { cleanError, cleanText, safeUrl } from '../hooks/safe'
+import { job, jobCounts, jobsNeedingAttention } from '../hooks/status'
 
 const HOSTS = { githubHosts: ['github.acme.test'], gitlabHosts: ['code.acme.test'] }
 
@@ -88,4 +89,20 @@ test('12. links: only http(s), never with embedded credentials', () => {
 test('12. errors never echo token-shaped values', () => {
   expect(cleanError(new Error('bad token glpat-dummy_token_do_not_use rejected'))).not.toContain('dummy_token')
   expect(cleanError(new Error('bad ghp_dummy_token_do_not_use'))).not.toContain('dummy_token')
+})
+
+test('job filter keeps what needs a look and counts everything', () => {
+  const jobs = [
+    job('1', 'lint', 'passed'),
+    job('2', 'build', 'running'),
+    job('3', 'audit', 'failed', { label: 'Failed (allowed)', isAllowedFailure: true }),
+    job('4', 'deploy', 'manual', { label: 'Manual (blocking)' }),
+    job('5', 'optional', 'manual', { label: 'Manual (optional)' }),
+    job('6', 'docs', 'pending'),
+    job('7', 'mystery', 'unknown'),
+  ]
+
+  expect(jobsNeedingAttention(jobs).map(j => j.name)).toEqual(['build', 'audit', 'deploy', 'mystery'])
+  expect(jobCounts(jobs)).toBe('1 passed · 1 failed · 1 running · 1 pending · 2 manual · 1 unknown')
+  expect(jobCounts([])).toBe('')
 })

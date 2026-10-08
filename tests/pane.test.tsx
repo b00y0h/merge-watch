@@ -211,6 +211,46 @@ test('6/7. requests render on terminal and desktop; titles and jobs link to thei
   expect(h.opened[0]).toEqual({ id: 'merge-watch', title: 'Merge Watch', focus: true })
 })
 
+test('only running, failed and blocking jobs get a row; the rest are counted', async ($, on) => {
+  const fake = sample()
+  fake.jobs['829']!.push(glJob(8, 'dependency-audit', 'failed', { allow_failure: true }), glJob(9, 'deploy', 'manual', { allow_failure: false }), glJob(10, 'optional', 'manual', { allow_failure: true }))
+  const h = harness(on, { fake })
+  await start($, h)
+
+  for (const surface of SURFACES) {
+    const ui = await $.ui.mount(pane(surface))
+    const all = await texts(ui)
+
+    // Passed, pending and skipped jobs have no row of their own.
+    expect(await jobLink(ui, 1)).toBeUndefined()
+    expect(await jobLink(ui, 4)).toBeUndefined()
+    expect(await jobLink(ui, 7)).toBeUndefined()
+    expect(await jobLink(ui, 10)).toBeUndefined()
+    // Running, failed (allowed too) and blocking manual jobs do.
+    expect((await jobLink(ui, 3))?.props.label).toBe('build')
+    expect((await jobLink(ui, 6))?.props.label).toBe('integration tests')
+    expect((await jobLink(ui, 8))?.props.label).toBe('dependency-audit')
+    expect((await jobLink(ui, 9))?.props.label).toBe('deploy')
+    expect(all).toContain('Failed (allowed)')
+    // Every job is still accounted for on the pipeline line.
+    expect(all).toContain('2 passed · 1 running · 1 pending')
+    expect(all).toContain('1 passed · 2 failed · 2 manual · 1 skipped')
+    await ui.unmount()
+  }
+})
+
+test('a collapsed request is two lines: title and status', async ($, on) => {
+  const h = harness(on, { fake: sample() })
+  await start($, h)
+  const ui = await $.ui.mount(pane('terminal'))
+  await ui.press({ key: 'toggle-139' })
+  const all = await texts(ui)
+
+  expect(all).toContain('Open · Changes requested · Not ready to merge · Changes requested')
+  expect(await jobLink(ui, 6)).toBeUndefined()
+  expect(all).not.toContain('fix-checkout → main')
+})
+
 test('7. narrow panes and long lists keep every request reachable', async ($, on) => {
   const many = fakeGitLab({ mrs: Array.from({ length: 60 }, (_, i) => glMr(i + 1)) })
   const h = harness(on, { fake: many })
@@ -230,9 +270,9 @@ test('6/11. the arrow collapses a request without opening it, and the choice is 
   await start($, h)
   const ui = await $.ui.mount(pane('terminal'))
 
-  expect(await jobLink(ui, 1)).toBeDefined()
+  expect(await jobLink(ui, 3)).toBeDefined()
   await ui.press({ key: 'toggle-142' })
-  expect(await jobLink(ui, 1)).toBeUndefined()
+  expect(await jobLink(ui, 3)).toBeUndefined()
   expect(await link(ui, '!142 ')).toBeDefined()
   expect(h.store.get(`expanded:gitlab:${GL_HOST}/${GL_PATH}`)).toEqual({ '142': false })
 })
@@ -379,7 +419,7 @@ test('11. expansion choices do not leak between repositories', async ($, on) => 
   const ui = await $.ui.mount(pane('terminal'))
 
   // The other host's saved collapse does not apply here.
-  expect(await jobLink(ui, 1)).toBeDefined()
+  expect(await jobLink(ui, 3)).toBeDefined()
 })
 
 test('starting a session does nothing until /merge-watch is run', async ($, on) => {
