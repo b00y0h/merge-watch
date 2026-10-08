@@ -1,0 +1,28 @@
+{
+  "name": "merge-watch",
+  "version": "0.1.0",
+  "description": "A panel that lists every open merge request or pull request in this repository with its review state and CI/CD jobs, refreshed once a minute.",
+  "author": { "name": "Bob Smith" },
+  "repository": "https://github.com/b00y0h/merge-watch",
+  "types": "./types/index.d.ts",
+  "userConfig": {
+    "github_token": {
+      "type": "string",
+      "title": "GitHub token (GitHub repositories only)",
+      "description": "A read-only GitHub token for pull requests, checks, actions and commit statuses. Stored in secure storage. Leave empty for GitLab projects, or set GITHUB_TOKEN in Claude Code's environment instead.",
+      "sensitive": true
+    },
+    "github_hosts": {
+      "type": "string",
+      "title": "GitHub Enterprise hosts",
+      "description": "Comma-separated GitHub Enterprise hostnames, e.g. github.example.com. github.com is always recognised.",
+      "default": ""
+    },
+    "gitlab_hosts": {
+      "type": "string",
+      "title": "Extra self-hosted GitLab hosts",
+      "description": "Comma-separated GitLab hostnames that do not contain the word gitlab. gitlab.com and gitlab.* hosts are always recognised.",
+      "default": ""
+    }
+  }
+}

@@ -1,0 +1,12 @@
+{
+  "name": "merge-watch",
+  "owner": { "name": "Bob Smith" },
+  "description": "Merge Watch, a Claude Code mod that shows open merge requests and their CI in a panel.",
+  "plugins": [
+    {
+      "name": "merge-watch",
+      "source": "./",
+      "description": "A panel that lists every open merge request or pull request with its review state and CI/CD jobs, refreshed once a minute."
+    }
+  ]
+}
