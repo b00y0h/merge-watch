@@ -1,7 +1,7 @@
 import { expect, test } from 'claude-code/testing'
 
 import { mergeGitHub, retryFailedGitHub } from '../hooks/github'
-import { segmentWidths } from '../hooks/merge-watch'
+import { normalizeView, segmentWidths } from '../hooks/merge-watch'
 import type { HttpResponse } from '../hooks/github'
 import { job } from '../hooks/status'
 import { groupOf, jobMix, reasonLine, splitCells, stripPrefix } from '../hooks/view-model'
@@ -141,4 +141,16 @@ test('summary segments fill the width exactly and every label fits', () => {
   const b = segmentWidths([{ count: 40, min: 10 }, { count: 1, min: 11 }], 40)
   expect(sum(b)).toBe(40)
   expect(b[1]).toBe(11)
+})
+
+test('a panel state saved by an older version gains the fields this one reads', () => {
+  // 0.3.0 wrote no confirm or notices; $.state keeps it across a plugin update in one session.
+  const old = { phase: 'ready', repo: null, candidates: [], isRefreshing: false, isChoosing: false, notice: null } as never
+  const view = normalizeView(old)
+
+  expect(view.notices).toEqual({})
+  expect(view.confirm).toBeNull()
+  expect(view.phase).toBe('ready')
+  expect(normalizeView(undefined).phase).toBe('idle')
+  expect(normalizeView({ notices: { '1': 'Merge requested.' } }).notices).toEqual({ '1': 'Merge requested.' })
 })

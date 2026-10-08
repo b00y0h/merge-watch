@@ -171,9 +171,27 @@ export function staleSnapshot(
 // State writes (each mirrored for /clear)
 // ---------------------------------------------------------------------------
 
+/**
+ * Fills in any field an older version of Merge Watch did not write. $.state outlives a plugin
+ * update within a session, so a view saved by an earlier release can lack newer fields.
+ */
+export function normalizeView(v: Partial<MergeWatchView> | null | undefined): MergeWatchView {
+  return {
+    ...INITIAL_VIEW,
+    ...(v ?? {}),
+    candidates: Array.isArray(v?.candidates) ? v.candidates : [],
+    confirm: v?.confirm ?? null,
+    notices: v?.notices !== null && typeof v?.notices === 'object' ? v.notices : {},
+  }
+}
+
+async function readView($: $): Promise<MergeWatchView> {
+  return normalizeView(await read($, viewAtom))
+}
+
 async function setView($: $, fn: (v: MergeWatchView) => MergeWatchView): Promise<void> {
   await update($, viewAtom, v => {
-    lastView = fn(v)
+    lastView = fn(normalizeView(v))
 
     return lastView
   })
@@ -277,7 +295,7 @@ async function useRepo($: $, repo: MergeWatchRepo, candidates: MergeWatchRepo[],
 }
 
 async function selectRepo($: $, repo: MergeWatchRepo): Promise<void> {
-  const view = await read($, viewAtom)
+  const view = await readView($)
   await saveCheckoutPrefs($, { selection: repo.key })
   const prefs = await loadCheckoutPrefs($)
   await useRepo($, repo, view.candidates, prefs.enabled !== false)
@@ -357,7 +375,7 @@ async function refresh($: $, isManual: boolean): Promise<void> {
     await inflight.catch(() => undefined)
   }
 
-  const view = await read($, viewAtom)
+  const view = await readView($)
   const repo = view.repo
 
   if (view.phase !== 'ready' || repo === null) {
@@ -378,7 +396,7 @@ async function refresh($: $, isManual: boolean): Promise<void> {
 
     try {
       const fresh = await fetchRequests($, repo, now)
-      const current = await read($, viewAtom)
+      const current = await readView($)
 
       if (gen !== generation || current.repo?.key !== repo.key) {
         return
@@ -394,7 +412,7 @@ async function refresh($: $, isManual: boolean): Promise<void> {
         nextRetryAt: null,
       })
     } catch (error) {
-      const current = await read($, viewAtom)
+      const current = await readView($)
 
       if (gen !== generation || current.repo?.key !== repo.key) {
         return
@@ -443,14 +461,14 @@ function stopMonitoring(): void {
 
 /** Opens the pane with the keyboard. Only ever called because someone asked for it. */
 async function openPane($: $): Promise<void> {
-  const repo = (await read($, viewAtom)).repo
+  const repo = (await readView($)).repo
 
   await $.ui.open({ id: PANE_ID, title: repo === null ? 'Merge Watch' : `Merge Watch · ${repo.path}`, focus: true })
 }
 
 async function setEnabled($: $, enabled: boolean): Promise<void> {
   await saveCheckoutPrefs($, { enabled })
-  const view = await read($, viewAtom)
+  const view = await readView($)
 
   if (view.repo !== null) {
     await setView($, v => ({ ...v, phase: enabled ? 'ready' : 'off' }))
@@ -465,7 +483,7 @@ async function setEnabled($: $, enabled: boolean): Promise<void> {
 }
 
 async function toggleExpanded($: $, key: string): Promise<void> {
-  const view = await read($, viewAtom)
+  const view = await readView($)
   const current = await read($, expandedAtom)
   const next = { ...current, [key]: current[key] !== true }
   await setExpanded($, next)
@@ -486,7 +504,7 @@ async function copyLink($: $, url: string, surface: 'terminal' | 'desktop' | 'mo
  */
 async function activate($: $): Promise<void> {
   await resolveRepo($)
-  const view = await read($, viewAtom)
+  const view = await readView($)
 
   if (view.repo !== null) {
     await saveCheckoutPrefs($, { enabled: true })
@@ -507,7 +525,7 @@ const NOT_RUNNING = "Merge Watch isn't running in this session. Run /merge-watch
 
 /** Expands every listed row, or collapses them all when they are all open already. */
 async function toggleExpandAll($: $, keys: readonly string[]): Promise<void> {
-  const view = await read($, viewAtom)
+  const view = await readView($)
   const current = await read($, expandedAtom)
   const allOpen = keys.length > 0 && keys.every(k => current[k] === true)
   const next = { ...current }
@@ -524,7 +542,7 @@ async function toggleExpandAll($: $, keys: readonly string[]): Promise<void> {
 }
 
 async function toggleShowAll($: $): Promise<void> {
-  const view = await read($, viewAtom)
+  const view = await readView($)
   const next = !(await read($, showAllAtom))
   await update($, showAllAtom, () => next)
 
@@ -556,7 +574,7 @@ async function setNotice($: $, key: string, text: string | null): Promise<void> 
  * Retry re-runs only failures that are not allowed to fail; merge is pinned to the commit shown.
  */
 async function runAction($: $, key: string, action: 'retry' | 'merge'): Promise<void> {
-  const view = await read($, viewAtom)
+  const view = await readView($)
   const snapshot = await read($, snapshotAtom)
   const repo = view.repo
   const request = snapshot?.requests.find(r => r.key === key)
@@ -676,7 +694,7 @@ export function registerMergeWatch(on: On, options: PluginOptions): void {
     const [action = '', ...rest] = e.args.trim().split(/\s+/).filter(Boolean)
 
     const verb = action.toLowerCase()
-    const before = await read($, viewAtom)
+    const before = await readView($)
     const isStopped = before.phase === 'idle' || before.phase === 'off'
 
     // Starting (or restarting) is only ever this command's doing.
@@ -698,7 +716,7 @@ export function registerMergeWatch(on: On, options: PluginOptions): void {
       await resolveRepo($)
     }
 
-    const view = await read($, viewAtom)
+    const view = await readView($)
 
     switch (verb) {
       case '':
@@ -764,7 +782,7 @@ export function registerMergeWatch(on: On, options: PluginOptions): void {
     const { Box, Text, Button, Link } = $.ui.resolve(e)
     const svgTable = e.surface === 'desktop' ? $.ui.resolve(e) : null
     const Svg = svgTable !== null && 'Svg' in svgTable ? svgTable.Svg : null
-    const view = await read($, viewAtom)
+    const view = await readView($)
     const snapshot = await read($, snapshotAtom)
     const expanded = await read($, expandedAtom)
     const showAll = await read($, showAllAtom)

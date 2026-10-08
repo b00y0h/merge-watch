@@ -1,6 +1,6 @@
 {
   "name": "merge-watch",
-  "version": "0.4.1",
+  "version": "0.4.2",
   "description": "A panel that groups every open merge request or pull request by whether it can merge, shows failing jobs, and can retry or merge after you confirm. Refreshed once a minute.",
   "author": { "name": "Bob Smith" },
   "repository": "https://github.com/b00y0h/merge-watch",

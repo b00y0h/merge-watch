@@ -555,7 +555,7 @@ export async function retryFailedGitHub(repo: MergeWatchRepo, send: HttpSend, to
   let count = 0
 
   for (const pipeline of request.ci.pipelines) {
-    if (pipeline.runId === null || !pipeline.jobs.some(j => j.state === 'failed' && !j.isAllowedFailure)) {
+    if (!pipeline.runId || !pipeline.jobs.some(j => j.state === 'failed' && !j.isAllowedFailure)) {
       continue
     }
 

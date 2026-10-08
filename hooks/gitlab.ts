@@ -547,7 +547,7 @@ export async function retryFailedGitLab(repo: MergeWatchRepo, glab: GlabRunner, 
   let count = 0
 
   for (const pipeline of flatten(request.ci.pipelines)) {
-    if (pipeline.projectId === null || pipeline.isPreviousRevision) {
+    if (!pipeline.projectId || pipeline.isPreviousRevision) {
       continue
     }
 
