@@ -443,7 +443,9 @@ function stopMonitoring(): void {
 
 /** Opens the pane with the keyboard. Only ever called because someone asked for it. */
 async function openPane($: $): Promise<void> {
-  await $.ui.open({ id: PANE_ID, title: 'Merge Watch', focus: true })
+  const repo = (await read($, viewAtom)).repo
+
+  await $.ui.open({ id: PANE_ID, title: repo === null ? 'Merge Watch' : `Merge Watch · ${repo.path}`, focus: true })
 }
 
 async function setEnabled($: $, enabled: boolean): Promise<void> {
@@ -588,6 +590,42 @@ async function runAction($: $, key: string, action: 'retry' | 'merge'): Promise<
   }
 
   void refresh($, true)
+}
+
+/**
+ * Splits `total` cells among segments in proportion to their counts, never below each
+ * segment's `min` (its label plus padding), and always summing to exactly `total` when it can.
+ */
+export function segmentWidths(segments: readonly { count: number; min: number }[], total: number): number[] {
+  const sum = segments.reduce((n, s) => n + s.count, 0)
+  const widths = segments.map(s => Math.max(s.min, Math.round((s.count / Math.max(1, sum)) * total)))
+  let over = widths.reduce((n, w) => n + w, 0) - total
+
+  // Take any excess from the widest segments first, never below their minimum.
+  while (over > 0) {
+    let widest = -1
+
+    widths.forEach((w, i) => {
+      if (w > segments[i]!.min && (widest === -1 || w > widths[widest]!)) {
+        widest = i
+      }
+    })
+
+    if (widest === -1) {
+      break
+    }
+
+    widths[widest] = widths[widest]! - 1
+    over -= 1
+  }
+
+  // Hand any shortfall to the widest segment so the bar ends flush.
+  if (over < 0 && widths.length > 0) {
+    const widest = widths.indexOf(Math.max(...widths))
+    widths[widest] = widths[widest]! - over
+  }
+
+  return widths
 }
 
 const USAGE =
@@ -741,13 +779,16 @@ export function registerMergeWatch(on: On, options: PluginOptions): void {
     const IID_COLS = 7
     const BAR_CELLS = 10
     const TITLE_COLS = Math.max(10, W - IID_COLS - BAR_CELLS - 4)
+    // The desktop app frames the pane with its own title bar (title, maximise, close); the
+    // terminal shows no title while one pane is open, so it gets the header row.
+    const hasOwnChrome = e.surface !== 'terminal'
 
     // The rows the ⤢ button opens or closes; filled in once the list is known.
     let visibleKeys: string[] = []
 
     const clip = (text: string, cols: number) => (text.length <= cols ? text : `${text.slice(0, Math.max(1, cols - 1))}…`)
 
-    const header = (
+    const header = hasOwnChrome ? null : (
       <Box key="header" flexDirection="row" justifyContent="space-between" columnGap={1}>
         <Text wrap="truncate-end">
           <Text color={C.muted}>Merge Watch · </Text>
@@ -859,46 +900,22 @@ export function registerMergeWatch(on: On, options: PluginOptions): void {
     let summary: RenderElement | null = null
 
     if (segments.length > 0) {
-      const total = segments.reduce((n, s) => n + s.count, 0)
-
-      if (Svg !== null) {
-        let x = 0
-        const parts = segments.map((s, i) => {
-          const width = (s.count / total) * 100
-          const gap = i === segments.length - 1 ? 0 : 0.6
-          const rect = `<rect x="${x}%" y="0" width="${Math.max(0.5, width - gap)}%" height="28" rx="6" fill="${TINT[s.group].bg}"/><text x="${x + 1.2}%" y="18.5" font-family="system-ui, sans-serif" font-size="12.5" font-weight="600" fill="${TINT[s.group].fg}">${segmentText(s.group, s.count)}</text>`
-          x += width
-
-          return rect
-        })
-        summary = (
-          <Box key="summary" marginTop={1}>
-            <Svg
-              source={`<svg xmlns="http://www.w3.org/2000/svg" width="100%" height="28">${parts.join('')}</svg>`}
-              alt={segments.map(s => segmentText(s.group, s.count)).join(', ')}
-              height={28}
-            />
-          </Box>
-        )
-      } else {
-        let left = W
-        summary = (
-          <Box key="summary" flexDirection="row" columnGap={0} marginTop={1}>
-            {segments.map((s, i) => {
-              const cols = i === segments.length - 1 ? left : Math.max(segmentText(s.group, s.count).length + 2, Math.round((s.count / total) * W))
-              left -= cols
-
-              return (
-                <Box key={`seg-${s.group}`} width={Math.max(1, cols)} backgroundColor={TINT[s.group].bg}>
-                  <Text bold color={TINT[s.group].fg} backgroundColor={TINT[s.group].bg} wrap="truncate-end">
-                    {` ${segmentText(s.group, s.count)}`}
-                  </Text>
-                </Box>
-              )
-            })}
-          </Box>
-        )
-      }
+      const gaps = segments.length - 1
+      const widths = segmentWidths(
+        segments.map(s => ({ count: s.count, min: segmentText(s.group, s.count).length + 2 })),
+        W - gaps,
+      )
+      summary = (
+        <Box key="summary" flexDirection="row" columnGap={1} marginTop={hasOwnChrome ? 0 : 1}>
+          {segments.map((s, i) => (
+            <Box key={`seg-${s.group}`} width={widths[i]} flexShrink={0} backgroundColor={TINT[s.group].bg}>
+              <Text bold color={TINT[s.group].fg} backgroundColor={TINT[s.group].bg} wrap="truncate">
+                {` ${segmentText(s.group, s.count)}`}
+              </Text>
+            </Box>
+          ))}
+        </Box>
+      )
     }
 
     // ---- one request -----------------------------------------------------
@@ -1103,15 +1120,23 @@ export function registerMergeWatch(on: On, options: PluginOptions): void {
 
       const title = GROUP_LABEL[g]
       const count = String(rows.length)
+      // Rule characters are wider than a cell in the desktop app's font, so draw fewer there.
+      const ruleCells = Math.max(0, W - title.length - count.length - 3)
       body.push(
         <Box key={`group-${g}`} flexDirection="row" marginTop={1}>
-          <Text bold color={g === 'ready' ? C.green : g === 'failing' ? C.red : C.muted}>
-            {title}
-          </Text>
-          <Text color={C.faint}>{` ${count} `}</Text>
-          <Text color={C.hairline} wrap="truncate-end">
-            {'─'.repeat(Math.max(0, W - title.length - count.length - 2))}
-          </Text>
+          <Box flexShrink={0}>
+            <Text bold color={g === 'ready' ? C.green : g === 'failing' ? C.red : C.muted} wrap="truncate">
+              {title}
+            </Text>
+          </Box>
+          <Box flexShrink={0}>
+            <Text color={C.faint}>{` ${count} `}</Text>
+          </Box>
+          <Box flexGrow={1} flexShrink={1} overflow="hidden">
+            <Text color={C.hairline} wrap="truncate">
+              {'─'.repeat(hasOwnChrome ? Math.floor(ruleCells * 0.55) : ruleCells)}
+            </Text>
+          </Box>
         </Box>,
       )
 
@@ -1134,6 +1159,8 @@ export function registerMergeWatch(on: On, options: PluginOptions): void {
           {`${shown.length} of ${all.length} open · ${data?.fetchedAt == null ? 'not loaded' : `updated ${formatTime(data.fetchedAt)}`}${view.isRefreshing ? ' · refreshing…' : ''}`}
         </Text>
         {(hidden > 0 || showAll) && <Button key="show-all" plain label={showAll ? 'show recent' : 'show all'} onPress={() => toggleShowAll($)} />}
+        {hasOwnChrome && <Button key="refresh" plain label="↻ refresh" onPress={() => refresh($, true)} />}
+        {hasOwnChrome && <Button key="expand" plain label={visibleKeys.every(k => expanded[k] === true) && visibleKeys.length > 0 ? 'collapse all' : 'expand all'} onPress={() => toggleExpandAll($, visibleKeys)} />}
       </Box>
     )
 

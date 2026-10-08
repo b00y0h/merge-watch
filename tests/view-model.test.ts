@@ -1,6 +1,7 @@
 import { expect, test } from 'claude-code/testing'
 
 import { mergeGitHub, retryFailedGitHub } from '../hooks/github'
+import { segmentWidths } from '../hooks/merge-watch'
 import type { HttpResponse } from '../hooks/github'
 import { job } from '../hooks/status'
 import { groupOf, jobMix, reasonLine, splitCells, stripPrefix } from '../hooks/view-model'
@@ -128,4 +129,16 @@ test('GitHub Retry re-runs failed jobs per run; Merge is pinned to the head comm
   }
 
   expect(message).toBe('GitHub answered 405: Pull Request is not mergeable')
+})
+
+test('summary segments fill the width exactly and every label fits', () => {
+  const sum = (xs: number[]) => xs.reduce((n, x) => n + x, 0)
+  const a = segmentWidths([{ count: 5, min: 9 }, { count: 4, min: 11 }, { count: 1, min: 9 }], 58)
+
+  expect(sum(a)).toBe(58)
+  expect(a[2]).toBeGreaterThanOrEqual(9)
+  expect(a[0]).toBeGreaterThan(a[1]!)
+  const b = segmentWidths([{ count: 40, min: 10 }, { count: 1, min: 11 }], 40)
+  expect(sum(b)).toBe(40)
+  expect(b[1]).toBe(11)
 })

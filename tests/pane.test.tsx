@@ -198,7 +198,15 @@ test('6/7. grouped rows on terminal and desktop; the title toggles, Open MR and 
     const ui = await $.ui.mount(pane(surface))
     let all = await texts(ui)
 
-    expect(all).toContain(`Merge Watch · ${GL_PATH}`)
+    // The terminal draws its own header; the desktop app titles the pane itself.
+    if (surface === 'terminal') {
+      expect(all).toContain(`Merge Watch · ${GL_PATH}`)
+      expect(await ui.find({ key: 'close' })).toBeDefined()
+    } else {
+      expect(await ui.find({ key: 'close' })).toBeUndefined()
+      expect((await ui.find({ key: 'refresh' }))?.props.label).toBe('↻ refresh')
+    }
+
     expect(all).toContain('PIPELINE FAILING')
     expect(all).toContain('DRAFTS')
     expect(all).not.toContain('READY TO MERGE')
@@ -223,7 +231,7 @@ test('6/7. grouped rows on terminal and desktop; the title toggles, Open MR and 
     await ui.unmount()
   }
 
-  expect(h.opened[0]).toEqual({ id: 'merge-watch', title: 'Merge Watch', focus: true })
+  expect(h.opened[0]).toEqual({ id: 'merge-watch', title: `Merge Watch · ${GL_PATH}`, focus: true })
 })
 
 test('the job table lists failures, running and allowed failures, five at a time', async ($, on) => {
@@ -526,14 +534,14 @@ test('Merge asks first and pins the merge to the commit shown', async ($, on) =>
   ])
 })
 
-test('the desktop app draws the summary and pipeline bars as SVG; the terminal uses text', async ($, on) => {
+test('the desktop app draws the pipeline bars as SVG; the summary bar is text on both', async ($, on) => {
   const h = harness(on, { fake: sample() })
   await start($, h)
   const desktop = await $.ui.mount(pane('desktop'))
-  const svgs = await desktop.findAll({ type: 'Svg' })
 
-  expect(svgs.length).toBe(4)
-  expect(String(svgs[0]?.props.alt)).toBe('2 failing, 1 draft')
+  expect(await desktop.findAll({ type: 'Svg' })).toHaveLength(3)
+  expect(await desktop.find({ type: 'Text', text: ' 2 failing' })).toBeDefined()
+  expect(await desktop.find({ type: 'Text', text: ' 1 draft' })).toBeDefined()
   await desktop.unmount()
   const terminal = await $.ui.mount(pane('terminal'))
   expect(await terminal.findAll({ type: 'Svg' })).toHaveLength(0)
@@ -556,7 +564,7 @@ test('7. in the desktop app (isInteractive false, surface attached) /merge-watch
   await command($, '')
   await h.clock.settle()
   expect(h.listCalls()).toBe(1)
-  expect(h.opened).toEqual([{ id: 'merge-watch', title: 'Merge Watch', focus: true }])
+  expect(h.opened).toEqual([{ id: 'merge-watch', title: `Merge Watch · ${GL_PATH}`, focus: true }])
   await h.clock.advance(60_000)
   expect(h.listCalls()).toBe(2)
 })
@@ -597,6 +605,6 @@ test('commands: hide keeps monitoring, bare command opens with focus', async ($,
   await h.clock.advance(60_000)
   expect(h.listCalls()).toBe(2)
   await command($, '')
-  expect(h.opened.at(-1)).toEqual({ id: 'merge-watch', title: 'Merge Watch', focus: true })
+  expect(h.opened.at(-1)).toEqual({ id: 'merge-watch', title: `Merge Watch · ${GL_PATH}`, focus: true })
   expect(await command($, 'bogus')).toContain('/merge-watch refresh')
 })
