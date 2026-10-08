@@ -44,6 +44,10 @@ export type MergeWatchPipeline = {
   notes: string[]
   jobs: MergeWatchJob[]
   children: MergeWatchPipeline[]
+  /** GitLab: the project that owns the pipeline (jobs are retried there). Null elsewhere. */
+  projectId: string | null
+  /** GitHub: the workflow run id (failed jobs are re-run through it). Null elsewhere. */
+  runId: string | null
 }
 
 export type MergeWatchRequest = {
@@ -71,6 +75,12 @@ export type MergeWatchRequest = {
     pipelines: MergeWatchPipeline[]
   }
   updatedAt: string
+  /** The commit a merge is pinned to, so a push after the panel drew is never merged blind. */
+  headSha: string
+  /** The provider says this request can be merged now by you. */
+  canMerge: boolean
+  /** A review or approval is still outstanding. */
+  needsReview: boolean
   /** This request's data could not be refreshed; what is shown is from `staleSince`. */
   error: string | null
   staleSince: number | null
@@ -115,6 +125,10 @@ export type MergeWatchView = {
   isRefreshing: boolean
   isChoosing: boolean
   notice: string | null
+  /** A write action waiting for its confirm press: which request and what. */
+  confirm: { key: string; action: 'retry' | 'merge' } | null
+  /** The outcome of the last action per request, shown in its expanded row. */
+  notices: Record<string, string>
 }
 
 declare module 'claude-code' {
@@ -123,6 +137,10 @@ declare module 'claude-code' {
       view: MergeWatchView
       snapshot: MergeWatchSnapshot | null
       expanded: Record<string, boolean>
+      /** Show requests not updated in the last 14 days too. */
+      showAll: boolean
+      /** Requests whose expanded job table lists every failure, not the first five. */
+      moreFailed: Record<string, boolean>
     }
   }
 }

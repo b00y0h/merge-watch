@@ -19,6 +19,8 @@ type Harness = {
   opened: Record<string, unknown>[]
   clock: ReturnType<typeof mock.clock>
   slow: { list: number }
+  /** glab calls that were not GETs: the write actions. */
+  writes: string[][]
 }
 
 /** Stubs the engine beneath the mod: git, glab, store, clock and the pane calls. */
@@ -35,6 +37,7 @@ function harness(
     opened: [],
     clock: mock.clock(on, { now: Date.UTC(2026, 9, 8, 14, 32, 5) }),
     slow: { list: 0 },
+    writes: [],
   }
   const calls: string[][] = []
   h.listCalls = () => calls.filter(a => /merge_requests\?state=opened/.test(a[5] ?? '')).length
@@ -92,6 +95,13 @@ function harness(
 
     if (cmd === 'glab') {
       calls.push([...args])
+
+      if (args[4] !== 'GET') {
+        h.writes.push([...args])
+
+        return run(0, '{}', '')
+      }
+
       const host = args[2]
       const isList = /merge_requests\?state=opened/.test(args[5] ?? '')
 
@@ -174,81 +184,105 @@ async function jobLink(ui: Finder, id: number): Promise<Found | undefined> {
 
 async function texts(ui: { findAll: (q: { type?: string }) => Promise<{ text: string; type: string; props: Record<string, unknown> }[]> }): Promise<string> {
   const all = [...(await ui.findAll({ type: 'Text' })), ...(await ui.findAll({ type: 'Link' })), ...(await ui.findAll({ type: 'Button' }))]
+  // The desktop summary bar is an SVG; its alt text says what it shows.
+  const svgs = await ui.findAll({ type: 'Svg' })
 
-  return all.map(e => e.text || String(e.props.label ?? '')).join('\n')
+  return [...all.map(e => e.text || String(e.props.label ?? '')), ...svgs.map(e => String(e.props.alt ?? ''))].join('\n')
 }
 
-test('6/7. requests render on terminal and desktop; titles and jobs link to their exact pages', async ($, on) => {
+test('6/7. grouped rows on terminal and desktop; the title toggles, Open MR and jobs link out', async ($, on) => {
   const h = harness(on, { fake: sample() })
   await start($, h)
 
   for (const surface of SURFACES) {
     const ui = await $.ui.mount(pane(surface))
-    const title = await link(ui, '!142 ')
-    const job = await jobLink(ui, 6)
-    const all = await texts(ui)
+    let all = await texts(ui)
 
-    expect(title?.type).toBe('Link')
-    expect(title?.props.href).toBe(`${GL_WEB}/-/merge_requests/142`)
-    expect(title?.props.label).toBe('!142 Add the pricing page')
-    expect(job?.props.href).toBe(`${GL_WEB}/-/jobs/6`)
-    expect(job?.props.label).toBe('integration tests')
     expect(all).toContain(`Merge Watch · ${GL_PATH}`)
-    expect(all).toContain('3 open MRs · Updated')
-    expect(all).toContain('▶ Running')
-    expect(all).toContain('✕ Failed')
-    expect(all).toContain('Changes requested')
-    expect(all).toContain('pricing-page → main · by alex')
-    expect(all).toContain('· No pipeline')
-    // Sorted newest first, ties broken by number: 142, 139, 136.
-    const order = (await ui.findAll({ type: 'Link' })).map(l => String(l.props.label)).filter(l => l.startsWith('!'))
-    expect(order).toEqual(['!142 Add the pricing page', '!139 Fix checkout validation', '!136 Update account settings'])
-    // The arrow is its own control; the title stays a link.
-    expect((await ui.find({ key: 'toggle-142' }))?.type).toBe('Button')
+    expect(all).toContain('PIPELINE FAILING')
+    expect(all).toContain('DRAFTS')
+    expect(all).not.toContain('READY TO MERGE')
+    expect(all).toContain('2 failing')
+    expect(all).toContain('1 draft')
+    expect(all).toContain('3 of 3 open · updated')
+    // Collapsed by default: the cleaned title is the row's toggle, with a reason line under it.
+    expect((await ui.find({ key: 'toggle-142' }))?.props.label).toBe('Add the pricing page')
+    expect(all).toContain('▶ running — build')
+    expect(all).toContain('✕ integration tests')
+    expect(await link(ui, 'Open MR')).toBeUndefined()
+
+    await ui.press({ key: 'toggle-139' })
+    all = await texts(ui)
+    expect((await link(ui, 'Open MR'))?.props.href).toBe(`${GL_WEB}/-/merge_requests/139`)
+    expect((await jobLink(ui, 6))?.props.label).toBe('integration tests')
+    expect(all).toContain('Open · Changes requested')
+    expect(all).not.toContain('Changes requested · Changes requested')
+    expect(all).toContain('#829 · 1 passed · 1 failed · 1 skipped')
+    expect(await ui.find({ key: 'retry-139' })).toBeDefined()
+    await ui.press({ key: 'toggle-139' })
     await ui.unmount()
   }
 
   expect(h.opened[0]).toEqual({ id: 'merge-watch', title: 'Merge Watch', focus: true })
 })
 
-test('only running, failed and blocking jobs get a row; the rest are counted', async ($, on) => {
+test('the job table lists failures, running and allowed failures, five at a time', async ($, on) => {
   const fake = sample()
-  fake.jobs['829']!.push(glJob(8, 'dependency-audit', 'failed', { allow_failure: true }), glJob(9, 'deploy', 'manual', { allow_failure: false }), glJob(10, 'optional', 'manual', { allow_failure: true }))
+  fake.jobs['829']!.push(
+    glJob(8, 'dependency-audit', 'failed', { allow_failure: true }),
+    ...Array.from({ length: 6 }, (_, i) => glJob(20 + i, `shard ${i + 1}`, 'failed')),
+  )
   const h = harness(on, { fake })
   await start($, h)
 
   for (const surface of SURFACES) {
     const ui = await $.ui.mount(pane(surface))
-    const all = await texts(ui)
+    await ui.press({ key: 'toggle-139' })
+    let all = await texts(ui)
 
-    // Passed, pending and skipped jobs have no row of their own.
-    expect(await jobLink(ui, 1)).toBeUndefined()
-    expect(await jobLink(ui, 4)).toBeUndefined()
-    expect(await jobLink(ui, 7)).toBeUndefined()
-    expect(await jobLink(ui, 10)).toBeUndefined()
-    // Running, failed (allowed too) and blocking manual jobs do.
-    expect((await jobLink(ui, 3))?.props.label).toBe('build')
-    expect((await jobLink(ui, 6))?.props.label).toBe('integration tests')
+    // Seven real failures: the reason line summarises, the table shows five and a toggle.
+    expect(all).toContain('✕ 7 jobs failing — integration tests, shard 1, shard 2…')
+    expect(await jobLink(ui, 5)).toBeUndefined()
     expect((await jobLink(ui, 8))?.props.label).toBe('dependency-audit')
-    expect((await jobLink(ui, 9))?.props.label).toBe('deploy')
-    expect(all).toContain('Failed (allowed)')
-    // Every job is still accounted for on the pipeline line.
-    expect(all).toContain('2 passed · 1 running · 1 pending')
-    expect(all).toContain('1 passed · 2 failed · 2 manual · 1 skipped')
+    expect(all).toContain('allowed')
+    expect(await jobLink(ui, 25)).toBeUndefined()
+    expect((await ui.find({ key: 'more-139' }))?.props.label).toBe('+2 more failed')
+    await ui.press({ key: 'more-139' })
+    expect(await jobLink(ui, 25)).toBeDefined()
+    expect((await ui.find({ key: 'more-139' }))?.props.label).toBe('Show fewer')
+    await ui.press({ key: 'more-139' })
+    await ui.press({ key: 'toggle-139' })
+    all = await texts(ui)
+    expect(all).not.toContain('dependency-audit')
     await ui.unmount()
   }
 })
 
-test('a collapsed request is two lines: title and status', async ($, on) => {
-  const h = harness(on, { fake: sample() })
+test('ready, failing and draft groups follow mergeability, not CI alone', async ($, on) => {
+  const fake = sample()
+  fake.mrs.push(glMr(150, { title: 'docs(adr): add ADR-1000 buttons', updated_at: '2026-10-08T14:10:00Z' }))
+  fake.details['150'] = {
+    ...glMr(150, { title: 'docs(adr): add ADR-1000 buttons', updated_at: '2026-10-08T14:10:00Z' }),
+    sha: 'p150',
+    detailed_merge_status: 'mergeable',
+    reviewers: [{ username: 'sam' }],
+    head_pipeline: glPipeline(850, 'p150', { status: 'success', detailed_status: { group: 'success-with-warnings' } }),
+  }
+  fake.approvals['150'] = { approved: false, approvals_left: 0, approved_by: [] }
+  fake.jobs['850'] = [glJob(30, 'lint', 'success'), glJob(31, 'dependency-audit', 'failed', { allow_failure: true })]
+  const h = harness(on, { fake })
   await start($, h)
   const ui = await $.ui.mount(pane('terminal'))
-  await ui.press({ key: 'toggle-139' })
   const all = await texts(ui)
 
-  expect(all).toContain('Open · Changes requested · Not ready to merge · Changes requested')
-  expect(await jobLink(ui, 6)).toBeUndefined()
-  expect(all).not.toContain('fix-checkout → main')
+  expect(all).toContain('READY TO MERGE')
+  expect(all).toContain('1 ready')
+  expect((await ui.find({ key: 'toggle-150' }))?.props.label).toBe('add ADR-1000 buttons')
+  expect(all).toContain('✓ needs review · 1 allowed failure')
+  // Awaiting review: the primary action is Review (a link), not Merge.
+  await ui.press({ key: 'toggle-150' })
+  expect((await link(ui, 'Review'))?.props.href).toBe(`${GL_WEB}/-/merge_requests/150`)
+  expect(await ui.find({ key: 'merge-150' })).toBeUndefined()
 })
 
 test('7. narrow panes and long lists keep every request reachable', async ($, on) => {
@@ -258,23 +292,31 @@ test('7. narrow panes and long lists keep every request reachable', async ($, on
 
   for (const surface of SURFACES) {
     const ui = await $.ui.mount(pane(surface, 28))
-    const links = (await ui.findAll({ type: 'Link' })).filter(l => String(l.props.label).startsWith('!'))
+    const toggles = (await ui.findAll({ type: 'Button' })).filter(b => String(b.key ?? '').startsWith('toggle-'))
 
-    expect(links).toHaveLength(60)
+    expect(toggles).toHaveLength(60)
     await ui.unmount()
   }
 })
 
-test('6/11. the arrow collapses a request without opening it, and the choice is saved per repository', async ($, on) => {
+test('6/11. the chevron expands a row, and the choice is saved per repository', async ($, on) => {
   const h = harness(on, { fake: sample() })
   await start($, h)
   const ui = await $.ui.mount(pane('terminal'))
 
-  expect(await jobLink(ui, 3)).toBeDefined()
-  await ui.press({ key: 'toggle-142' })
   expect(await jobLink(ui, 3)).toBeUndefined()
-  expect(await link(ui, '!142 ')).toBeDefined()
-  expect(h.store.get(`expanded:gitlab:${GL_HOST}/${GL_PATH}`)).toEqual({ '142': false })
+  await ui.press({ key: 'chev-142' })
+  expect((await jobLink(ui, 3))?.props.label).toBe('build')
+  expect(h.store.get(`expanded:gitlab:${GL_HOST}/${GL_PATH}`)).toEqual({ '142': true })
+  await ui.press({ key: 'chev-142' })
+  expect(await jobLink(ui, 3)).toBeUndefined()
+
+  // ⤢ opens every row, and again closes them all.
+  await ui.press({ key: 'expand' })
+  expect(await jobLink(ui, 3)).toBeDefined()
+  expect(await jobLink(ui, 6)).toBeDefined()
+  await ui.press({ key: 'expand' })
+  expect(await jobLink(ui, 6)).toBeUndefined()
 })
 
 test('8. fetches at once, then every 60 seconds, without overlapping refreshes', async ($, on) => {
@@ -334,10 +376,9 @@ test('9/11. a late answer for the previous repository is discarded after switchi
   await h.clock.settle()
 
   const ui = await $.ui.mount(pane('terminal'))
-  const labels = (await ui.findAll({ type: 'Link' })).map(l => String(l.props.label))
 
-  expect(labels).toContain('!999 From the other host')
-  expect(labels.some(l => l.includes('pricing'))).toBe(false)
+  expect((await ui.find({ key: 'toggle-999' }))?.props.label).toBe('From the other host')
+  expect(await ui.find({ key: 'toggle-142' })).toBeUndefined()
   expect(h.store.get('checkout:/work/project/.git')).toMatchObject({ selection: `gitlab:${OTHER_HOST}/${GL_PATH}` })
 })
 
@@ -372,11 +413,13 @@ test('10. a failed refresh keeps the last data, labelled stale; rate limits slow
   h.fake.failures['merge_requests/139'] = 'HTTP 500 Internal Server Error'
   await h.clock.advance(60_000)
   let ui = await $.ui.mount(pane('terminal'))
+  await ui.press({ key: 'toggle-139' })
   let all = await texts(ui)
 
   expect(all).toContain("! Couldn't refresh !139")
-  expect(all).toContain('✕ Failed (stale)')
-  expect(await link(ui, '!142 ')).toBeDefined()
+  expect(all).toContain('✕ integration tests')
+  expect(await ui.find({ key: 'toggle-142' })).toBeDefined()
+  await ui.press({ key: 'toggle-139' })
   await ui.unmount()
 
   h.fake.failures = { merge_requests: '429 Too Many Requests' }
@@ -388,7 +431,9 @@ test('10. a failed refresh keeps the last data, labelled stale; rate limits slow
   expect(all).toContain("! Couldn't refresh: GitLab is rate limiting")
   expect(all).toContain('Showing stale data from')
   expect(all).toContain('Polling slowed by the provider. Next try at')
-  expect(await link(ui, '!142 ')).toBeDefined()
+  expect(await ui.find({ key: 'toggle-142' })).toBeDefined()
+  // Stale data can never sit in READY TO MERGE.
+  expect(all).not.toContain('READY TO MERGE')
   await h.clock.advance(60_000)
   expect(h.listCalls()).toBe(calls)
 })
@@ -406,20 +451,92 @@ test('10. a timed-out glab call is reported, never shown as passing', async ($, 
   const h = harness(on, { fake: sample() })
   h.fake.failures['pipelines/830/jobs'] = 'glab: context deadline exceeded (timeout)'
   await start($, h)
-  const all = await texts(await $.ui.mount(pane('terminal')))
+  const ui = await $.ui.mount(pane('terminal'))
+  await ui.press({ key: 'toggle-142' })
+  const all = await texts(ui)
 
   expect(all).toContain('Jobs unavailable')
-  expect(all).not.toContain('✓ Passed\n')
+  expect(all).not.toContain('READY TO MERGE')
 })
 
 test('11. expansion choices do not leak between repositories', async ($, on) => {
   const h = harness(on, { fake: sample() })
-  h.store.set(`expanded:gitlab:${OTHER_HOST}/${GL_PATH}`, { '142': false })
+  h.store.set(`expanded:gitlab:${OTHER_HOST}/${GL_PATH}`, { '139': true })
   await start($, h)
   const ui = await $.ui.mount(pane('terminal'))
 
-  // The other host's saved collapse does not apply here.
-  expect(await jobLink(ui, 3)).toBeDefined()
+  // The other host's saved expansion does not open !139 here.
+  expect(await jobLink(ui, 6)).toBeUndefined()
+})
+
+test('requests idle for 14 days hide behind "show all", remembered per repository', async ($, on) => {
+  const fake = sample()
+  fake.mrs.push(glMr(90, { title: 'Old idea', updated_at: '2026-09-01T00:00:00Z' }))
+  const h = harness(on, { fake })
+  await start($, h)
+  const ui = await $.ui.mount(pane('terminal'))
+
+  expect(await ui.find({ key: 'toggle-90' })).toBeUndefined()
+  expect(await texts(ui)).toContain('3 of 4 open')
+  await ui.press({ key: 'show-all' })
+  expect(await ui.find({ key: 'toggle-90' })).toBeDefined()
+  expect(await texts(ui)).toContain('4 of 4 open')
+  expect(h.store.get(`showAll:gitlab:${GL_HOST}/${GL_PATH}`)).toBe(true)
+  expect((await ui.find({ key: 'show-all' }))?.props.label).toBe('show recent')
+})
+
+test('Retry failed asks first, then retries only real failures in the owning project', async ($, on) => {
+  const fake = sample()
+  fake.jobs['829']!.push(glJob(8, 'dependency-audit', 'failed', { allow_failure: true }))
+  const h = harness(on, { fake })
+  await start($, h)
+  const ui = await $.ui.mount(pane('terminal'))
+  await ui.press({ key: 'toggle-139' })
+
+  await ui.press({ key: 'retry-139' })
+  expect(h.writes).toHaveLength(0)
+  expect((await ui.find({ key: 'confirm-139' }))?.props.label).toBe('Confirm retry of 1 job')
+  await ui.press({ key: 'cancel-139' })
+  expect(h.writes).toHaveLength(0)
+
+  await ui.press({ key: 'retry-139' })
+  await ui.press({ key: 'confirm-139' })
+  await h.clock.settle()
+  expect(h.writes).toEqual([['api', '--hostname', GL_HOST, '--method', 'POST', 'projects/1/jobs/6/retry']])
+  expect(await texts(ui)).toContain('Retried 1 failed job.')
+})
+
+test('Merge asks first and pins the merge to the commit shown', async ($, on) => {
+  const fake = sample()
+  fake.mrs.push(glMr(160, { title: 'feat: ship it', updated_at: '2026-10-08T14:20:00Z' }))
+  fake.details['160'] = { ...glMr(160, { title: 'feat: ship it' }), sha: 'abc160', detailed_merge_status: 'mergeable', user: { can_merge: true }, head_pipeline: glPipeline(860, 'abc160', { status: 'success' }) }
+  fake.approvals['160'] = { approved: true, approvals_left: 0, approved_by: [{ user: { username: 'sam' } }] }
+  fake.jobs['860'] = [glJob(40, 'lint', 'success')]
+  const h = harness(on, { fake })
+  await start($, h)
+  const ui = await $.ui.mount(pane('terminal'))
+  await ui.press({ key: 'toggle-160' })
+
+  await ui.press({ key: 'merge-160' })
+  expect(h.writes).toHaveLength(0)
+  await ui.press({ key: 'confirm-160' })
+  await h.clock.settle()
+  expect(h.writes).toEqual([
+    ['api', '--hostname', GL_HOST, '--method', 'PUT', `projects/${encodeURIComponent(GL_PATH)}/merge_requests/160/merge`, '--raw-field', 'sha=abc160'],
+  ])
+})
+
+test('the desktop app draws the summary and pipeline bars as SVG; the terminal uses text', async ($, on) => {
+  const h = harness(on, { fake: sample() })
+  await start($, h)
+  const desktop = await $.ui.mount(pane('desktop'))
+  const svgs = await desktop.findAll({ type: 'Svg' })
+
+  expect(svgs.length).toBe(4)
+  expect(String(svgs[0]?.props.alt)).toBe('2 failing, 1 draft')
+  await desktop.unmount()
+  const terminal = await $.ui.mount(pane('terminal'))
+  expect(await terminal.findAll({ type: 'Svg' })).toHaveLength(0)
 })
 
 test('starting a session does nothing until /merge-watch is run', async ($, on) => {

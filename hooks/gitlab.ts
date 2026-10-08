@@ -1,5 +1,5 @@
-// GitLab adapter: read-only `glab api` GET requests, mapped to the shared display model.
-// Nothing here creates pipelines, plays or retries jobs, or changes merge requests.
+// GitLab adapter: `glab api` GET requests mapped to the shared display model, plus the two
+// write actions the pane offers after a confirm press: retry failed jobs and merge.
 
 import type { MergeWatchCiState, MergeWatchJob, MergeWatchPipeline, MergeWatchRepo, MergeWatchRequest } from '../types'
 import { cleanError, cleanText, safeUrl } from './safe'
@@ -283,6 +283,8 @@ async function loadPipeline(ctx: Ctx, raw: Json, depth: number): Promise<MergeWa
     notes: [],
     jobs: [],
     children: [],
+    projectId: projectId === '' ? null : projectId,
+    runId: null,
   }
 
   try {
@@ -328,6 +330,8 @@ async function loadPipeline(ctx: Ctx, raw: Json, depth: number): Promise<MergeWa
         notes: ['Not loaded: nested deeper than one level'],
         jobs: [],
         children: [],
+        projectId: str(downstream.project_id) || null,
+        runId: null,
       })
       continue
     }
@@ -354,6 +358,8 @@ async function loadPipeline(ctx: Ctx, raw: Json, depth: number): Promise<MergeWa
         notes: ['Not accessible with your GitLab access'],
         jobs: [],
         children: [],
+        projectId: null,
+        runId: null,
       })
     }
   }
@@ -452,6 +458,7 @@ async function loadRequest(ctx: Ctx, listed: Json): Promise<MergeWatchRequest> {
   const state = pipelines.length === 0 ? 'no-pipeline' : rollup(pipelines)
   const { readiness, blockers } = gitlabReadiness(detail)
   const author = asRecord(detail.author)
+  const review = gitlabReview(detail, approvals)
 
   return {
     key: iid,
@@ -464,11 +471,14 @@ async function loadRequest(ctx: Ctx, listed: Json): Promise<MergeWatchRequest> {
     targetBranch: cleanText(detail.target_branch, 120),
     sourceProject,
     isDraft: detail.draft === true || detail.work_in_progress === true,
-    review: gitlabReview(detail, approvals),
+    review,
     readiness,
     blockers,
     ci: { state, label: pipelines.length === 0 ? 'No pipeline' : ciLabel(state, pipelines), pipelines },
     updatedAt: str(detail.updated_at),
+    headSha: str(asRecord(detail.diff_refs).head_sha) || str(detail.sha),
+    canMerge: str(detail.detailed_merge_status) === 'mergeable' && asRecord(detail.user).can_merge !== false,
+    needsReview: review.startsWith('Awaiting review'),
     error: null,
     staleSince: null,
   }
@@ -495,6 +505,9 @@ function unavailableRequest(listed: Json, error: unknown): MergeWatchRequest {
     blockers: [],
     ci: { state: 'unavailable', label: 'Unavailable', pipelines: [] },
     updatedAt: str(listed.updated_at),
+    headSha: str(listed.sha),
+    canMerge: false,
+    needsReview: false,
     error: cleanError(error),
     staleSince: null,
   }
@@ -519,4 +532,50 @@ export async function fetchGitLab(repo: MergeWatchRepo, glab: GlabRunner, now: n
       return unavailableRequest(mr, error)
     }
   })
+}
+
+// ---------------------------------------------------------------------------
+// Write actions. Only ever run after the person confirms in the pane.
+// ---------------------------------------------------------------------------
+
+function flatten(pipelines: readonly MergeWatchPipeline[]): MergeWatchPipeline[] {
+  return pipelines.flatMap(p => [p, ...flatten(p.children)])
+}
+
+/** Re-runs every failed job that is not allowed to fail, in the project that owns its pipeline. */
+export async function retryFailedGitLab(repo: MergeWatchRepo, glab: GlabRunner, request: MergeWatchRequest, now: number): Promise<number> {
+  let count = 0
+
+  for (const pipeline of flatten(request.ci.pipelines)) {
+    if (pipeline.projectId === null || pipeline.isPreviousRevision) {
+      continue
+    }
+
+    for (const j of pipeline.jobs) {
+      if (j.state !== 'failed' || j.isAllowedFailure || !/^\d+$/.test(j.id)) {
+        continue
+      }
+
+      try {
+        await glab(['api', '--hostname', repo.host, '--method', 'POST', `projects/${pipeline.projectId}/jobs/${j.id}/retry`])
+      } catch (error) {
+        throw classifyGlabError(error, repo.host, now)
+      }
+
+      count += 1
+    }
+  }
+
+  return count
+}
+
+/** Merges the MR, pinned to the commit the pane showed: GitLab refuses if the branch moved since. */
+export async function mergeGitLab(repo: MergeWatchRepo, glab: GlabRunner, request: MergeWatchRequest, now: number): Promise<void> {
+  const args = ['api', '--hostname', repo.host, '--method', 'PUT', `projects/${encodeURIComponent(repo.path)}/merge_requests/${request.number}/merge`]
+
+  try {
+    await glab(request.headSha === '' ? args : [...args, '--raw-field', `sha=${request.headSha}`])
+  } catch (error) {
+    throw classifyGlabError(error, repo.host, now)
+  }
 }

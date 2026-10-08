@@ -1,5 +1,5 @@
 // GitHub adapter: the documented REST API over the mods network API, mapped to the shared
-// display model. Read-only GET requests; nothing is re-run, approved or changed.
+// display model, plus the two write actions the pane offers after a confirm press.
 
 import type { MergeWatchCiState, MergeWatchJob, MergeWatchPipeline, MergeWatchRepo, MergeWatchRequest } from '../types'
 import { cleanError, cleanText, safeUrl } from './safe'
@@ -9,6 +9,9 @@ export type HttpResponse = { status: number; ok: boolean; headers: Record<string
 
 /** Performs one GET with the given headers. The caller adds timeouts and the credential. */
 export type HttpGet = (url: string, headers: Record<string, string>) => Promise<HttpResponse>
+
+/** Performs one request of any method; only the write actions use it. */
+export type HttpSend = (url: string, init: { method: string; headers: Record<string, string>; body?: string }) => Promise<HttpResponse>
 
 type Json = Record<string, unknown>
 
@@ -313,6 +316,8 @@ async function loadCi(ctx: Ctx, pr: { number: number; headSha: string; headRepo:
         notes: Number(run.run_attempt) > 1 ? [`Attempt ${Number(run.run_attempt)}`] : [],
         jobs: [],
         children: [],
+        projectId: null,
+        runId: str(run.id) || null,
       }
 
       try {
@@ -360,6 +365,8 @@ async function loadCi(ctx: Ctx, pr: { number: number; headSha: string; headRepo:
         notes: runsFailed === null ? [] : [`Workflow runs unavailable: ${runsFailed}`],
         jobs,
         children: [],
+        projectId: null,
+        runId: null,
       })
     } else if (runsFailed !== null) {
       pipelines.push(unavailableGroup('Workflow runs', runsFailed))
@@ -386,7 +393,7 @@ async function loadCi(ctx: Ctx, pr: { number: number; headSha: string; headRepo:
         })
       })
       const state = rollupJobs(jobs)
-      pipelines.push({ title: 'Commit statuses', state, label: STATE_WORD[state], url: null, isPreviousRevision: false, isIncomplete: false, notes: [], jobs, children: [] })
+      pipelines.push({ title: 'Commit statuses', state, label: STATE_WORD[state], url: null, isPreviousRevision: false, isIncomplete: false, notes: [], jobs, children: [], projectId: null, runId: null })
     }
   } catch (error) {
     if (error instanceof AuthError || error instanceof RateLimitError) {
@@ -400,7 +407,7 @@ async function loadCi(ctx: Ctx, pr: { number: number; headSha: string; headRepo:
 }
 
 function unavailableGroup(title: string, reason: string): MergeWatchPipeline {
-  return { title, state: 'unavailable', label: 'Unavailable', url: null, isPreviousRevision: false, isIncomplete: true, notes: [reason], jobs: [], children: [] }
+  return { title, state: 'unavailable', label: 'Unavailable', url: null, isPreviousRevision: false, isIncomplete: true, notes: [reason], jobs: [], children: [], projectId: null, runId: null }
 }
 
 async function loadRequest(ctx: Ctx, listed: Json): Promise<MergeWatchRequest> {
@@ -424,6 +431,8 @@ async function loadRequest(ctx: Ctx, listed: Json): Promise<MergeWatchRequest> {
   const pipelines = await loadCi(ctx, { number, headSha: str(head.sha), headRepo, baseRepo })
   const state = pipelines.length === 0 ? 'no-checks' : rollup(pipelines)
   const { readiness, blockers } = githubReadiness(detail)
+  const review = githubReview(detail, reviews)
+  const mergeState = str(detail.mergeable_state)
 
   return {
     key: String(number),
@@ -436,11 +445,14 @@ async function loadRequest(ctx: Ctx, listed: Json): Promise<MergeWatchRequest> {
     targetBranch: cleanText(base.ref, 120),
     sourceProject: headRepo === null ? 'deleted fork' : headRepo.toLowerCase() === baseRepo.toLowerCase() ? null : cleanText(headRepo),
     isDraft: detail.draft === true,
-    review: githubReview(detail, reviews),
+    review,
     readiness,
     blockers,
     ci: { state, label: pipelines.length === 0 ? 'No checks' : ciLabel(state, pipelines), pipelines },
     updatedAt: str(detail.updated_at),
+    headSha: str(head.sha),
+    canMerge: detail.mergeable === true && detail.draft !== true && (mergeState === 'clean' || mergeState === 'has_hooks'),
+    needsReview: review === 'Awaiting review',
     error: null,
     staleSince: null,
   }
@@ -465,6 +477,9 @@ function unavailableRequest(listed: Json, error: unknown): MergeWatchRequest {
     blockers: [],
     ci: { state: 'unavailable', label: 'Unavailable', pipelines: [] },
     updatedAt: str(listed.updated_at),
+    headSha: str(asRecord(listed.head).sha),
+    canMerge: false,
+    needsReview: false,
     error: cleanError(error),
     staleSince: null,
   }
@@ -490,4 +505,68 @@ export async function fetchGitHub(repo: MergeWatchRepo, get: HttpGet, token: str
       return unavailableRequest(pr, error)
     }
   })
+}
+
+// ---------------------------------------------------------------------------
+// Write actions. Only ever run after the person confirms in the pane.
+// ---------------------------------------------------------------------------
+
+async function write(repo: MergeWatchRepo, send: HttpSend, token: string | undefined, now: number, url: string, method: string, body?: unknown): Promise<void> {
+  if (token === undefined || token.trim() === '') {
+    throw new AuthError(`No GitHub token for ${repo.host}`, authHelp(repo.host))
+  }
+
+  const init = {
+    method,
+    headers: {
+      accept: 'application/vnd.github+json',
+      authorization: `Bearer ${token.trim()}`,
+      'x-github-api-version': '2022-11-28',
+      'user-agent': 'merge-watch-claude-code-mod',
+      ...(body === undefined ? {} : { 'content-type': 'application/json' }),
+    },
+    ...(body === undefined ? {} : { body: JSON.stringify(body) }),
+  }
+  const response = await send(url, init)
+
+  if (response.status === 401) {
+    throw new AuthError(`GitHub rejected the token for ${repo.host}`, authHelp(repo.host))
+  }
+
+  if (response.status === 429 || (response.status === 403 && response.headers['x-ratelimit-remaining'] === '0')) {
+    throw new RateLimitError(`GitHub rate limit reached for ${repo.host}`, now + 60_000)
+  }
+
+  if (!response.ok) {
+    let message = ''
+
+    try {
+      message = str(asRecord(JSON.parse(response.text)).message)
+    } catch {
+      message = ''
+    }
+
+    throw new Error(`GitHub answered ${response.status}${message === '' ? '' : `: ${cleanText(message, 160)}`}`)
+  }
+}
+
+/** Re-runs the failed jobs of every workflow run that has a failure that is not allowed. */
+export async function retryFailedGitHub(repo: MergeWatchRepo, send: HttpSend, token: string | undefined, request: MergeWatchRequest, now: number): Promise<number> {
+  let count = 0
+
+  for (const pipeline of request.ci.pipelines) {
+    if (pipeline.runId === null || !pipeline.jobs.some(j => j.state === 'failed' && !j.isAllowedFailure)) {
+      continue
+    }
+
+    await write(repo, send, token, now, `${apiBase(repo.host)}/repos/${repo.path}/actions/runs/${pipeline.runId}/rerun-failed-jobs`, 'POST')
+    count += pipeline.jobs.filter(j => j.state === 'failed' && !j.isAllowedFailure).length
+  }
+
+  return count
+}
+
+/** Merges the PR, pinned to the head commit the pane showed. */
+export async function mergeGitHub(repo: MergeWatchRepo, send: HttpSend, token: string | undefined, request: MergeWatchRequest, now: number): Promise<void> {
+  await write(repo, send, token, now, `${apiBase(repo.host)}/repos/${repo.path}/pulls/${request.number}/merge`, 'PUT', request.headSha === '' ? {} : { sha: request.headSha })
 }

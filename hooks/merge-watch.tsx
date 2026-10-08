@@ -11,15 +11,59 @@ import type {
   MergeWatchSnapshot,
   MergeWatchView,
 } from '../types'
-import { fetchGitHub } from './github'
-import type { HttpResponse } from './github'
-import { fetchGitLab } from './gitlab'
+import { fetchGitHub, mergeGitHub, retryFailedGitHub } from './github'
+import type { HttpResponse, HttpSend } from './github'
+import { fetchGitLab, mergeGitLab, retryFailedGitLab } from './gitlab'
+import type { GlabRunner } from './gitlab'
 import { chooseRepo, reposFromRemotes, splitHosts } from './repo'
 import type { HostConfig } from './repo'
 import { cleanError } from './safe'
-import { AuthError, RateLimitError, STATE_COLOR, STATE_ICON, jobCounts, jobsNeedingAttention, sortRequests } from './status'
+import { AuthError, RateLimitError, jobCounts, sortRequests } from './status'
+import {
+  FAILURES_SHOWN,
+  GROUP_LABEL,
+  GROUP_ORDER,
+  allowedFailures,
+  currentJobs,
+  groupOf,
+  isStale,
+  jobMix,
+  pipelineSummary,
+  realFailures,
+  reasonLine,
+  splitCells,
+  stripPrefix,
+} from './view-model'
+import type { Group, JobMix } from './view-model'
 
 type $ = EngineInterface
+
+// Design tokens. Colours are fixed hex (from the design's oklch values) because both the terminal
+// and the desktop app accept hex; tinted fills always set their own text colour, so they read in
+// light and dark themes alike.
+const C = {
+  muted: '#8a8984',
+  faint: '#9a9893',
+  hairline: '#ebe9e4',
+  green: '#137738',
+  red: '#b6322d',
+  amber: '#9a6500',
+  blue: '#2f6fb3',
+} as const
+
+const TINT: Record<Group, { bg: string; fg: string }> = {
+  ready: { bg: '#d1f2d7', fg: '#005725' },
+  failing: { bg: '#ffdeda', fg: '#9b1f1d' },
+  draft: { bg: '#efeee9', fg: '#5a5955' },
+}
+
+const BAR = {
+  passed: C.green,
+  failed: C.red,
+  allowed: C.amber,
+  manual: '#d6d4ce',
+  other: '#d6d4ce',
+} as const
 
 export const PANE_ID = 'merge-watch'
 export const REFRESH_MS = 60_000
@@ -34,11 +78,15 @@ const INITIAL_VIEW: MergeWatchView = {
   isRefreshing: false,
   isChoosing: false,
   notice: null,
+  confirm: null,
+  notices: {},
 }
 
 const viewAtom = atom({ plugin: 'merge-watch', key: 'view' } as const, INITIAL_VIEW)
 const snapshotAtom = atom({ plugin: 'merge-watch', key: 'snapshot' } as const, null)
 const expandedAtom = atom({ plugin: 'merge-watch', key: 'expanded' } as const, {})
+const showAllAtom = atom({ plugin: 'merge-watch', key: 'showAll' } as const, false)
+const moreFailedAtom = atom({ plugin: 'merge-watch', key: 'moreFailed' } as const, {})
 
 // Module state. A hot reload starts it over, and the host drops the old module's timers,
 // so a reload never leaves a second timer running.
@@ -216,6 +264,8 @@ async function resolveRepo($: $): Promise<void> {
 async function useRepo($: $, repo: MergeWatchRepo, candidates: MergeWatchRepo[], enabled: boolean): Promise<void> {
   const saved = await $.store.get(`expanded:${repo.key}`)
   await setExpanded($, saved !== null && typeof saved === 'object' ? (saved as Record<string, boolean>) : {})
+  const showAll = (await $.store.get(`showAll:${repo.key}`)) === true
+  await update($, showAllAtom, () => showAll)
 
   const snapshot = await read($, snapshotAtom)
 
@@ -255,26 +305,36 @@ async function withTimeout<T>($: $, work: Promise<T>, ms: number, what: string):
   }
 }
 
+/** Runs glab by argument vector in the checkout; rejects with its stderr. */
+function glabFor($: $): GlabRunner {
+  const cwd = checkout?.top
+
+  return async args => {
+    const result = await $.process.run(['glab', ...args], { cwd, timeoutMs: GLAB_TIMEOUT_MS })
+
+    if (result.exitCode !== 0) {
+      throw new Error(result.stderr.trim() || result.stdout.trim() || `glab exited with ${result.exitCode}`)
+    }
+
+    return result.stdout
+  }
+}
+
+/** Any-method HTTP for the GitHub write actions, with the same timeout as reads. */
+function sendFor($: $): HttpSend {
+  return (url, init) => withTimeout<HttpResponse>($, $.http.fetch(url, init), HTTP_TIMEOUT_MS, 'GitHub request')
+}
+
+async function githubToken($: $): Promise<string | undefined> {
+  return githubTokenOption ?? (await $.env.get('GITHUB_TOKEN')) ?? (await $.env.get('GH_TOKEN'))
+}
+
 async function fetchRequests($: $, repo: MergeWatchRepo, now: number): Promise<MergeWatchRequest[]> {
   if (repo.provider === 'gitlab') {
-    const cwd = checkout?.top
-
-    return fetchGitLab(
-      repo,
-      async args => {
-        const result = await $.process.run(['glab', ...args], { cwd, timeoutMs: GLAB_TIMEOUT_MS })
-
-        if (result.exitCode !== 0) {
-          throw new Error(result.stderr.trim() || result.stdout.trim() || `glab exited with ${result.exitCode}`)
-        }
-
-        return result.stdout
-      },
-      now,
-    )
+    return fetchGitLab(repo, glabFor($), now)
   }
 
-  const token = githubTokenOption ?? (await $.env.get('GITHUB_TOKEN')) ?? (await $.env.get('GH_TOKEN'))
+  const token = await githubToken($)
 
   return fetchGitHub(
     repo,
@@ -405,7 +465,7 @@ async function setEnabled($: $, enabled: boolean): Promise<void> {
 async function toggleExpanded($: $, key: string): Promise<void> {
   const view = await read($, viewAtom)
   const current = await read($, expandedAtom)
-  const next = { ...current, [key]: current[key] === false }
+  const next = { ...current, [key]: current[key] !== true }
   await setExpanded($, next)
 
   if (view.repo !== null) {
@@ -442,6 +502,93 @@ async function hasSurface($: $): Promise<boolean> {
 
 const NO_SURFACE = 'Merge Watch needs an app that can show its panel, such as the terminal or the desktop app.'
 const NOT_RUNNING = "Merge Watch isn't running in this session. Run /merge-watch to start it."
+
+/** Expands every listed row, or collapses them all when they are all open already. */
+async function toggleExpandAll($: $, keys: readonly string[]): Promise<void> {
+  const view = await read($, viewAtom)
+  const current = await read($, expandedAtom)
+  const allOpen = keys.length > 0 && keys.every(k => current[k] === true)
+  const next = { ...current }
+
+  for (const k of keys) {
+    next[k] = !allOpen
+  }
+
+  await setExpanded($, next)
+
+  if (view.repo !== null) {
+    await $.store.set(`expanded:${view.repo.key}`, next)
+  }
+}
+
+async function toggleShowAll($: $): Promise<void> {
+  const view = await read($, viewAtom)
+  const next = !(await read($, showAllAtom))
+  await update($, showAllAtom, () => next)
+
+  if (view.repo !== null) {
+    await $.store.set(`showAll:${view.repo.key}`, next)
+  }
+}
+
+async function toggleMoreFailed($: $, key: string): Promise<void> {
+  await update($, moreFailedAtom, m => ({ ...m, [key]: m[key] !== true }))
+}
+
+async function setNotice($: $, key: string, text: string | null): Promise<void> {
+  await setView($, v => {
+    const notices = { ...v.notices }
+
+    if (text === null) {
+      delete notices[key]
+    } else {
+      notices[key] = text
+    }
+
+    return { ...v, notices }
+  })
+}
+
+/**
+ * Runs a confirmed write action on one request, then refreshes so the pane shows the result.
+ * Retry re-runs only failures that are not allowed to fail; merge is pinned to the commit shown.
+ */
+async function runAction($: $, key: string, action: 'retry' | 'merge'): Promise<void> {
+  const view = await read($, viewAtom)
+  const snapshot = await read($, snapshotAtom)
+  const repo = view.repo
+  const request = snapshot?.requests.find(r => r.key === key)
+  await setView($, v => ({ ...v, confirm: null }))
+
+  if (repo === null || request === undefined) {
+    return
+  }
+
+  await setNotice($, key, action === 'retry' ? 'Retrying failed jobs…' : 'Merging…')
+  const now = await $.clock.now()
+
+  try {
+    if (action === 'retry') {
+      const count =
+        repo.provider === 'gitlab'
+          ? await retryFailedGitLab(repo, glabFor($), request, now)
+          : await retryFailedGitHub(repo, sendFor($), await githubToken($), request, now)
+      await setNotice($, key, count === 0 ? 'No failed jobs to retry.' : `Retried ${count} failed job${count === 1 ? '' : 's'}.`)
+    } else {
+      if (repo.provider === 'gitlab') {
+        await mergeGitLab(repo, glabFor($), request, now)
+      } else {
+        await mergeGitHub(repo, sendFor($), await githubToken($), request, now)
+      }
+
+      await setNotice($, key, 'Merge requested.')
+    }
+  } catch (error) {
+    await setNotice($, key, `! ${action === 'retry' ? 'Retry' : 'Merge'} failed: ${cleanError(error)}`)
+  }
+
+  void refresh($, true)
+}
 
 const USAGE =
   'Use /merge-watch to open the panel, or add refresh, hide, off, on or repo (for example /merge-watch refresh).'
@@ -577,28 +724,40 @@ export function registerMergeWatch(on: On, options: PluginOptions): void {
 
   on('ui.render', { component: 'Pane', requestId: PANE_ID }, async ($, e) => {
     const { Box, Text, Button, Link } = $.ui.resolve(e)
+    const svgTable = e.surface === 'desktop' ? $.ui.resolve(e) : null
+    const Svg = svgTable !== null && 'Svg' in svgTable ? svgTable.Svg : null
     const view = await read($, viewAtom)
     const snapshot = await read($, snapshotAtom)
     const expanded = await read($, expandedAtom)
+    const showAll = await read($, showAllAtom)
+    const moreFailed = await read($, moreFailedAtom)
+    const now = await $.clock.now()
     const columns = Number(e.props.bodyColumns)
-    // Some surfaces may not report a width; let them lay the pane out themselves.
-    const width = Number.isFinite(columns) && columns > 0 ? Math.max(24, columns) : undefined
+    // Some surfaces may not report a width; lay out for a typical sidebar then.
+    const W = Number.isFinite(columns) && columns > 0 ? Math.max(32, columns) : 60
     const repo = view.repo
     const data = snapshot !== null && repo !== null && snapshot.repoKey === repo.key ? snapshot : null
 
-    const header: RenderElement[] = [
-      <Text key="title" bold wrap="truncate-end">
-        {repo === null ? 'Merge Watch' : `Merge Watch · ${repo.path}`}
-      </Text>,
-    ]
+    const IID_COLS = 7
+    const BAR_CELLS = 10
+    const TITLE_COLS = Math.max(10, W - IID_COLS - BAR_CELLS - 4)
 
-    const controls = (
-      <Box key="controls" flexDirection="row" flexWrap="wrap" columnGap={1}>
-        <Button key="refresh" label="Refresh" onPress={() => refresh($, true)} />
-        <Button key="hide" label="Hide" onPress={() => $.ui.close({ id: PANE_ID })} />
-        {view.candidates.length > 1 && (
-          <Button key="choose" label="Repository" onPress={() => setView($, v => ({ ...v, isChoosing: !v.isChoosing }))} />
-        )}
+    // The rows the ⤢ button opens or closes; filled in once the list is known.
+    let visibleKeys: string[] = []
+
+    const clip = (text: string, cols: number) => (text.length <= cols ? text : `${text.slice(0, Math.max(1, cols - 1))}…`)
+
+    const header = (
+      <Box key="header" flexDirection="row" justifyContent="space-between" columnGap={1}>
+        <Text wrap="truncate-end">
+          <Text color={C.muted}>Merge Watch · </Text>
+          <Text bold>{repo === null ? '' : repo.path}</Text>
+        </Text>
+        <Box flexDirection="row" columnGap={1}>
+          <Button key="refresh" plain label="↻" onPress={() => refresh($, true)} />
+          <Button key="expand" plain label="⤢" onPress={() => toggleExpandAll($, visibleKeys)} />
+          <Button key="close" plain label="✕" onPress={() => $.ui.close({ id: PANE_ID })} />
+        </Box>
       </Box>
     )
 
@@ -608,26 +767,31 @@ export function registerMergeWatch(on: On, options: PluginOptions): void {
       </Text>
     )
 
+    const frame = (...children: (RenderElement | null)[]) => (
+      <Box flexDirection="column" width={W} rowGap={0}>
+        {children}
+      </Box>
+    )
+
     if (view.phase === 'not-git') {
-      return <Box flexDirection="column" width={width}>{[...header, message('msg', 'Open a Git project to use Merge Watch.')]}</Box>
+      return frame(header, message('msg', 'Open a Git project to use Merge Watch.'))
     }
 
     if (view.phase === 'no-remote') {
-      return (
-        <Box flexDirection="column" width={width}>
-          {[...header, message('msg', 'This repository has no GitLab or GitHub remote Merge Watch recognises. For a self-hosted host without "gitlab" in its name, add it to the gitlab_hosts or github_hosts option.')]}
-        </Box>
+      return frame(
+        header,
+        message('msg', 'This repository has no GitLab or GitHub remote Merge Watch recognises. For a self-hosted host without "gitlab" in its name, add it to the gitlab_hosts or github_hosts option.'),
       )
     }
 
     if (view.phase === 'idle') {
-      return <Box flexDirection="column" width={width}>{[...header, message('msg', 'Finding the repository…')]}</Box>
+      return frame(header, message('msg', 'Finding the repository…', C.muted))
     }
 
     const chooser =
       view.isChoosing || view.phase === 'choose-repo' ? (
         <Box key="chooser" flexDirection="column">
-          <Text dimColor>{view.phase === 'choose-repo' ? 'Several remotes could be the project. Pick one:' : 'Watch another remote:'}</Text>
+          <Text color={C.muted}>{view.phase === 'choose-repo' ? 'Several remotes could be the project. Pick one:' : 'Watch another remote:'}</Text>
           {view.candidates.map(r => (
             <Button
               key={`pick-${r.remoteName}`}
@@ -640,33 +804,34 @@ export function registerMergeWatch(on: On, options: PluginOptions): void {
       ) : null
 
     if (view.phase === 'choose-repo') {
-      return (
-        <Box flexDirection="column" width={width}>
-          {header}
-          {chooser}
-        </Box>
-      )
+      return frame(header, chooser)
     }
 
     if (view.phase === 'off') {
-      return (
-        <Box flexDirection="column" width={width}>
-          {header}
-          {message('msg', 'Monitoring is off for this repository.')}
-          <Button key="turn-on" label="Turn on" onPress={() => setEnabled($, true)} />
-        </Box>
+      return frame(
+        header,
+        message('msg', 'Monitoring is off for this repository.', C.muted),
+        <Button key="turn-on" label="Turn on" onPress={() => setEnabled($, true)} />,
       )
     }
 
+    // ---- data ------------------------------------------------------------
+    const all = data?.requests ?? []
+    const shown = showAll ? all : all.filter(r => !isStale(r, now))
+    const groups = new Map<Group, MergeWatchRequest[]>(GROUP_ORDER.map(g => [g, []]))
+
+    for (const r of shown) {
+      groups.get(groupOf(r))!.push(r)
+    }
+
+    visibleKeys = shown.map(r => r.key)
+
+    // ---- status lines (loading, errors, sign-in) -------------------------
     const status: RenderElement[] = []
-    const count = data?.requests.length ?? 0
-    const updated = data?.fetchedAt == null ? 'Not loaded yet' : `Updated ${formatTime(data.fetchedAt)}`
-    status.push(
-      <Text key="summary" wrap="truncate-end">
-        {data?.fetchedAt == null ? updated : `${noun(repo, count)} · ${updated}`}
-        {view.isRefreshing ? ' · Refreshing…' : ''}
-      </Text>,
-    )
+
+    if (data === null || data.fetchedAt === null) {
+      status.push(message('loading', view.isRefreshing ? 'Loading merge requests…' : 'Not loaded yet.', C.muted))
+    }
 
     if (data?.error != null) {
       status.push(
@@ -675,7 +840,7 @@ export function registerMergeWatch(on: On, options: PluginOptions): void {
           data.fetchedAt === null
             ? `! Couldn't load: ${data.error}`
             : `! Couldn't refresh: ${data.error}. Showing stale data from ${formatTime(data.fetchedAt)}.`,
-          'warning',
+          C.amber,
         ),
       )
     }
@@ -685,154 +850,294 @@ export function registerMergeWatch(on: On, options: PluginOptions): void {
     }
 
     if (data?.nextRetryAt != null) {
-      status.push(message('retry', `Polling slowed by the provider. Next try at ${formatTime(data.nextRetryAt)}.`, 'warning'))
+      status.push(message('retry', `Polling slowed by the provider. Next try at ${formatTime(data.nextRetryAt)}.`, C.amber))
     }
 
-    const rows: RenderElement[] = []
+    // ---- summary bar -----------------------------------------------------
+    const segments = GROUP_ORDER.map(g => ({ group: g, count: groups.get(g)!.length })).filter(s => s.count > 0)
+    const segmentText = (g: Group, n: number) => (g === 'ready' ? `${n} ready` : g === 'failing' ? `${n} failing` : `${n} draft${n === 1 ? '' : 's'}`)
+    let summary: RenderElement | null = null
 
-    for (const request of data?.requests ?? []) {
-      rows.push(...renderRequest(request, expanded[request.key] !== false, data?.fetchedAt ?? null))
+    if (segments.length > 0) {
+      const total = segments.reduce((n, s) => n + s.count, 0)
+
+      if (Svg !== null) {
+        let x = 0
+        const parts = segments.map((s, i) => {
+          const width = (s.count / total) * 100
+          const gap = i === segments.length - 1 ? 0 : 0.6
+          const rect = `<rect x="${x}%" y="0" width="${Math.max(0.5, width - gap)}%" height="28" rx="6" fill="${TINT[s.group].bg}"/><text x="${x + 1.2}%" y="18.5" font-family="system-ui, sans-serif" font-size="12.5" font-weight="600" fill="${TINT[s.group].fg}">${segmentText(s.group, s.count)}</text>`
+          x += width
+
+          return rect
+        })
+        summary = (
+          <Box key="summary" marginTop={1}>
+            <Svg
+              source={`<svg xmlns="http://www.w3.org/2000/svg" width="100%" height="28">${parts.join('')}</svg>`}
+              alt={segments.map(s => segmentText(s.group, s.count)).join(', ')}
+              height={28}
+            />
+          </Box>
+        )
+      } else {
+        let left = W
+        summary = (
+          <Box key="summary" flexDirection="row" columnGap={0} marginTop={1}>
+            {segments.map((s, i) => {
+              const cols = i === segments.length - 1 ? left : Math.max(segmentText(s.group, s.count).length + 2, Math.round((s.count / total) * W))
+              left -= cols
+
+              return (
+                <Box key={`seg-${s.group}`} width={Math.max(1, cols)} backgroundColor={TINT[s.group].bg}>
+                  <Text bold color={TINT[s.group].fg} backgroundColor={TINT[s.group].bg} wrap="truncate-end">
+                    {` ${segmentText(s.group, s.count)}`}
+                  </Text>
+                </Box>
+              )
+            })}
+          </Box>
+        )
+      }
     }
 
-    if (data !== null && data.fetchedAt !== null && count === 0 && data.error === null) {
-      rows.push(message('empty', `No open ${repo?.provider === 'github' ? 'pull' : 'merge'} requests.`))
+    // ---- one request -----------------------------------------------------
+    const miniBar = (key: string, mix: JobMix) => {
+      if (Svg !== null) {
+        const total = mix.passed + mix.failed + mix.allowed + mix.manual + mix.other
+        let x = 0
+        const rects = (['passed', 'failed', 'allowed', 'manual', 'other'] as const)
+          .filter(k => mix[k] > 0)
+          .map(k => {
+            const w = total === 0 ? 44 : (mix[k] / total) * 44
+            const r = `<rect x="${x.toFixed(2)}" y="0" width="${w.toFixed(2)}" height="6" fill="${BAR[k]}"/>`
+            x += w
+
+            return r
+          })
+
+        return (
+          <Svg
+            key={key}
+            source={`<svg xmlns="http://www.w3.org/2000/svg" width="44" height="6" viewBox="0 0 44 6"><clipPath id="r"><rect width="44" height="6" rx="3"/></clipPath><g clip-path="url(#r)">${total === 0 ? `<rect width="44" height="6" fill="${BAR.other}"/>` : rects.join('')}</g></svg>`}
+            alt={`${mix.passed} passed, ${mix.failed} failed, ${mix.allowed} allowed to fail, ${mix.manual} manual`}
+            width={44}
+            height={6}
+          />
+        )
+      }
+
+      const cells = splitCells(mix, BAR_CELLS)
+
+      return (
+        <Text key={key}>
+          {(['passed', 'failed', 'allowed', 'manual', 'other'] as const)
+            .filter(k => cells[k] > 0)
+            .map(k => (
+              <Text key={k} color={BAR[k]}>
+                {'━'.repeat(cells[k])}
+              </Text>
+            ))}
+        </Text>
+      )
     }
 
-    return (
-      <Box flexDirection="column" width={width}>
-        {header}
-        {status}
-        {controls}
-        {chooser}
-        {rows}
+    const reasonColor = (r: MergeWatchRequest, g: Group) => (g === 'draft' ? C.muted : g === 'ready' ? C.green : reasonLine(r).startsWith('✕') ? C.red : C.muted)
+
+    const renderRow = (r: MergeWatchRequest, g: Group): RenderElement[] => {
+      const isOpen = expanded[r.key] === true
+      const out: RenderElement[] = [
+        <Box key={`row-${r.key}`} flexDirection="row" columnGap={1}>
+          <Box width={IID_COLS} flexShrink={0}>
+            <Text color={C.muted}>{r.ref}</Text>
+          </Box>
+          <Box flexDirection="column" flexGrow={1} flexShrink={1}>
+            <Button key={`toggle-${r.key}`} plain label={clip(stripPrefix(r.title), TITLE_COLS)} onPress={() => toggleExpanded($, r.key)} />
+            <Text color={reasonColor(r, g)} wrap="truncate-end">
+              {clip(reasonLine(r), TITLE_COLS)}
+            </Text>
+          </Box>
+          <Box flexDirection="row" columnGap={1} flexShrink={0}>
+            {miniBar(`bar-${r.key}`, jobMix(r))}
+            <Button key={`chev-${r.key}`} plain dimColor label={isOpen ? '▾' : '▸'} onPress={() => toggleExpanded($, r.key)} />
+          </Box>
+        </Box>,
+      ]
+
+      if (isOpen) {
+        out.push(renderDetail(r, g))
+      }
+
+      return out
+    }
+
+    const renderDetail = (r: MergeWatchRequest, g: Group): RenderElement => {
+      const k = `d-${r.key}`
+      const head = r.ci.pipelines[0]
+      const failed = realFailures(r)
+      const allowed = allowedFailures(r)
+      const running = currentJobs(r).filter(j => j.state === 'running')
+      const showEvery = moreFailed[r.key] === true
+      const listedFailures = showEvery ? failed : failed.slice(0, FAILURES_SHOWN)
+      const notice = view.notices[r.key]
+      const confirm = view.confirm !== null && view.confirm.key === r.key ? view.confirm.action : null
+      const label = (text: string) => (
+        <Box width={10} flexShrink={0}>
+          <Text color={C.muted}>{text}</Text>
+        </Box>
+      )
+      const jobRow = (id: string, name: string, url: string | null, word: string, color: string, isMuted: boolean) => (
+        <Box key={`${k}-j${id}`} flexDirection="row" justifyContent="space-between" columnGap={1}>
+          <Text color={isMuted ? C.muted : undefined} wrap="truncate-end">
+            {url === null ? name : <Link href={url} label={name} />}
+          </Text>
+          <Text color={color}>{word}</Text>
+        </Box>
+      )
+      const linkButton = (key: string, text: string, url: string) => (
+        <Box key={key} borderStyle="round" paddingX={1}>
+          <Link href={url} label={text} />
+        </Box>
+      )
+      const actions: RenderElement[] = []
+
+      if (confirm !== null) {
+        actions.push(
+          <Button
+            key={`confirm-${r.key}`}
+            variant="primary"
+            label={confirm === 'merge' ? `Confirm merge of ${r.ref}` : `Confirm retry of ${failed.length} job${failed.length === 1 ? '' : 's'}`}
+            onPress={() => runAction($, r.key, confirm)}
+          />,
+          <Button key={`cancel-${r.key}`} label="Cancel" onPress={() => setView($, v => ({ ...v, confirm: null }))} />,
+        )
+      } else if (g === 'ready' && r.canMerge && !r.needsReview) {
+        actions.push(<Button key={`merge-${r.key}`} variant="primary" label="Merge" onPress={() => setView($, v => ({ ...v, confirm: { key: r.key, action: 'merge' } }))} />)
+      } else if (g === 'ready' && r.url !== null) {
+        actions.push(linkButton(`review-${r.key}`, 'Review', r.url))
+      } else if (failed.length > 0) {
+        actions.push(<Button key={`retry-${r.key}`} variant="primary" label="Retry failed" onPress={() => setView($, v => ({ ...v, confirm: { key: r.key, action: 'retry' } }))} />)
+      }
+
+      if (confirm === null && r.url !== null) {
+        if (!(g === 'ready' && !r.canMerge)) {
+          actions.push(linkButton(`open-${r.key}`, 'Open MR', r.url))
+        }
+
+        const url = r.url
+        actions.push(<Button key={`copy-${r.key}`} label="Copy link" onPress={press => copyLink($, url, press.surface)} />)
+      }
+
+      return (
+        <Box key={k} flexDirection="column" paddingLeft={IID_COLS + 1} marginBottom={1}>
+          <Text wrap="wrap">{r.title}</Text>
+          <Box flexDirection="row">
+            {label('Status')}
+            <Text wrap="truncate-end">{[r.isDraft ? 'Draft' : 'Open', r.review, ...r.blockers.filter(b => b !== r.review && b !== 'Draft')].join(' · ')}</Text>
+          </Box>
+          <Box flexDirection="row">
+            {label('Branch')}
+            <Text wrap="truncate-end">{`${r.sourceBranch} → ${r.targetBranch} · ${r.author}${r.sourceProject === null ? '' : ` · from ${r.sourceProject}`}`}</Text>
+          </Box>
+          <Box flexDirection="row">
+            {label('Pipeline')}
+            <Text wrap="truncate-end">
+              {head === undefined ? (
+                r.ci.label
+              ) : head.url === null ? (
+                pipelineSummary(head, jobCounts(currentJobs(r)))
+              ) : (
+                <Link href={head.url} label={pipelineSummary(head, jobCounts(currentJobs(r)))} />
+              )}
+            </Text>
+          </Box>
+          {r.ci.pipelines.flatMap(p => p.notes).map((note, i) => (
+            <Text key={`${k}-n${i}`} color={note.startsWith('Previous revision') ? C.amber : C.muted} wrap="truncate-end">
+              {note}
+            </Text>
+          ))}
+          {r.error !== null && (
+            <Text color={C.amber} wrap="wrap">
+              {r.staleSince === null ? `! Details unavailable: ${r.error}` : `! Couldn't refresh ${r.ref}: ${r.error}. Showing data from ${formatTime(r.staleSince)}.`}
+            </Text>
+          )}
+          {listedFailures.length + allowed.length + running.length > 0 && (
+            <Box flexDirection="column" borderStyle="round" paddingX={1} marginTop={1}>
+              {listedFailures.map(j => jobRow(j.id, j.name, j.url, 'failed', C.red, false))}
+              {running.map(j => jobRow(j.id, j.name, j.url, 'running', C.blue, false))}
+              {allowed.map(j => jobRow(j.id, j.name, j.url, 'allowed', C.amber, true))}
+            </Box>
+          )}
+          {failed.length > FAILURES_SHOWN && (
+            <Button
+              key={`more-${r.key}`}
+              plain
+              dimColor
+              label={showEvery ? 'Show fewer' : `+${failed.length - FAILURES_SHOWN} more failed`}
+              onPress={() => toggleMoreFailed($, r.key)}
+            />
+          )}
+          {notice !== undefined && (
+            <Text color={notice.startsWith('!') ? C.amber : C.muted} wrap="wrap">
+              {notice}
+            </Text>
+          )}
+          {actions.length > 0 && (
+            <Box flexDirection="row" flexWrap="wrap" columnGap={1} marginTop={1}>
+              {actions}
+            </Box>
+          )}
+        </Box>
+      )
+    }
+
+    // ---- groups ----------------------------------------------------------
+    const body: RenderElement[] = []
+
+    for (const g of GROUP_ORDER) {
+      const rows = groups.get(g)!
+
+      if (rows.length === 0) {
+        continue
+      }
+
+      const title = GROUP_LABEL[g]
+      const count = String(rows.length)
+      body.push(
+        <Box key={`group-${g}`} flexDirection="row" marginTop={1}>
+          <Text bold color={g === 'ready' ? C.green : g === 'failing' ? C.red : C.muted}>
+            {title}
+          </Text>
+          <Text color={C.faint}>{` ${count} `}</Text>
+          <Text color={C.hairline} wrap="truncate-end">
+            {'─'.repeat(Math.max(0, W - title.length - count.length - 2))}
+          </Text>
+        </Box>,
+      )
+
+      for (const r of rows) {
+        body.push(...renderRow(r, g))
+      }
+    }
+
+    if (data !== null && data.fetchedAt !== null && all.length === 0 && data.error === null) {
+      body.push(message('empty', `No open ${repo?.provider === 'github' ? 'pull' : 'merge'} requests.`, C.muted))
+    } else if (data !== null && shown.length === 0 && all.length > 0) {
+      body.push(message('empty', `No ${repo?.provider === 'github' ? 'PRs' : 'MRs'} updated in the last 14 days.`, C.muted))
+    }
+
+    // ---- footer ----------------------------------------------------------
+    const hidden = all.length - shown.length
+    const footer = (
+      <Box key="footer" flexDirection="row" columnGap={1} marginTop={1}>
+        <Text color={C.muted} wrap="truncate-end">
+          {`${shown.length} of ${all.length} open · ${data?.fetchedAt == null ? 'not loaded' : `updated ${formatTime(data.fetchedAt)}`}${view.isRefreshing ? ' · refreshing…' : ''}`}
+        </Text>
+        {(hidden > 0 || showAll) && <Button key="show-all" plain label={showAll ? 'show recent' : 'show all'} onPress={() => toggleShowAll($)} />}
       </Box>
     )
 
-    // Two lines per request when collapsed; expanded adds the branch line, one summary line per
-    // pipeline, and a row only for the jobs that need a look (running, failed, blocked, unknown).
-    function renderRequest(r: MergeWatchRequest, isOpen: boolean, fetchedAt: number | null): RenderElement[] {
-      const k = `r-${r.key}`
-      const isStale = r.staleSince !== null
-      const isReady = r.readiness === 'Ready to merge'
-      const ciText = `${STATE_ICON[r.ci.state]} ${r.ci.label}${isStale ? ' (stale)' : ''}`
-      const statusLine = [r.isDraft ? 'Draft' : 'Open', r.review, `${isReady ? '✓ ' : ''}${r.readiness}`, ...r.blockers].join(' · ')
-      const out: RenderElement[] = [
-        <Box key={`${k}-head`} flexDirection="row" justifyContent="space-between" columnGap={1}>
-          <Box flexDirection="row" flexShrink={1} columnGap={1}>
-            <Button key={`toggle-${r.key}`} plain label={isOpen ? '▾' : '▸'} onPress={() => toggleExpanded($, r.key)} />
-            {r.url === null ? (
-              <Text bold wrap="truncate-end">{`${r.ref} ${r.title} (no link)`}</Text>
-            ) : (
-              <Text wrap="truncate-end">
-                <Link key={`link-${r.key}`} href={r.url} label={`${r.ref} ${r.title}`} />
-              </Text>
-            )}
-          </Box>
-          <Text color={isStale ? 'warning' : STATE_COLOR[r.ci.state]} wrap="truncate-end">
-            {ciText}
-          </Text>
-        </Box>,
-        <Text key={`${k}-status`} dimColor={!isReady} color={isReady ? 'success' : undefined} wrap="truncate-end">
-          {`  ${statusLine}`}
-        </Text>,
-      ]
-
-      if (r.error !== null) {
-        out.push(
-          <Text key={`${k}-error`} color="warning" wrap="wrap">
-            {isStale
-              ? `  ! Couldn't refresh ${r.ref}: ${r.error}. Showing data from ${formatTime(r.staleSince)}.`
-              : `  ! Details unavailable: ${r.error}`}
-          </Text>,
-        )
-      } else if (isStale) {
-        out.push(
-          <Text key={`${k}-stale`} color="warning" wrap="truncate-end">
-            {`  ! Stale: showing data from ${formatTime(r.staleSince ?? fetchedAt)}`}
-          </Text>,
-        )
-      }
-
-      if (!isOpen) {
-        return out
-      }
-
-      const url = r.url
-      out.push(
-        <Box key={`${k}-branch`} flexDirection="row" columnGap={1}>
-          <Text dimColor wrap="truncate-end">
-            {`  ${r.sourceBranch} → ${r.targetBranch} · by ${r.author}${r.sourceProject === null ? '' : ` · from ${r.sourceProject}`}`}
-          </Text>
-          {url !== null && <Button key={`copy-${r.key}`} plain dimColor label="copy link" onPress={press => copyLink($, url, press.surface)} />}
-        </Box>,
-      )
-
-      if (r.ci.pipelines.length === 0) {
-        out.push(
-          <Text key={`${k}-noci`} dimColor wrap="truncate-end">
-            {`  ${STATE_ICON[r.ci.state]} ${r.ci.label}`}
-          </Text>,
-        )
-      }
-
-      r.ci.pipelines.forEach((p, i) => out.push(...renderPipeline(p, `${k}-p${i}`, 2)))
-
-      return out
-    }
-
-    function renderPipeline(p: MergeWatchPipeline, k: string, indent: number): RenderElement[] {
-      const pad = ' '.repeat(indent)
-      const state = p.isPreviousRevision ? 'Previous revision' : p.label
-      const counts = jobCounts(p.jobs)
-      const out: RenderElement[] = [
-        <Box key={`${k}-head`} flexDirection="row" justifyContent="space-between" columnGap={1}>
-          <Box flexDirection="row" flexShrink={1}>
-            <Text>{pad}</Text>
-            <Text wrap="truncate-end">
-              {p.url === null ? p.title : <Link key={`${k}-link`} href={p.url} label={p.title} />}
-              {counts === '' ? '' : ` · ${counts}`}
-            </Text>
-          </Box>
-          <Text color={p.isPreviousRevision ? 'warning' : STATE_COLOR[p.state]} wrap="truncate-end">
-            {`${p.isPreviousRevision ? '↺' : STATE_ICON[p.state]} ${state}`}
-          </Text>
-        </Box>,
-      ]
-
-      p.notes.forEach((note, i) =>
-        out.push(
-          <Text key={`${k}-n${i}`} dimColor color={note.startsWith('Previous revision') ? 'warning' : undefined} wrap="truncate-end">
-            {`${pad}  ${note}`}
-          </Text>,
-        ),
-      )
-
-      if (p.isIncomplete && !p.notes.some(n => /unavailable|not loaded|could not|not accessible/i.test(n))) {
-        out.push(
-          <Text key={`${k}-inc`} color="warning" wrap="truncate-end">
-            {`${pad}  ! Some results are missing`}
-          </Text>,
-        )
-      }
-
-      jobsNeedingAttention(p.jobs).forEach(j => {
-        out.push(
-          <Box key={`${k}-j${j.id}`} flexDirection="row" justifyContent="space-between" columnGap={1}>
-            <Box flexDirection="row" flexShrink={1}>
-              <Text color={STATE_COLOR[j.state]}>{`${pad}  ${STATE_ICON[j.state]} `}</Text>
-              <Text wrap="truncate-end">{j.url === null ? `${j.name} (no link)` : <Link key={`job-${j.id}`} href={j.url} label={j.name} />}</Text>
-            </Box>
-            <Text color={STATE_COLOR[j.state]} wrap="truncate-end">
-              {j.label}
-            </Text>
-          </Box>,
-        )
-      })
-
-      p.children.forEach((child, i) => out.push(...renderPipeline(child, `${k}-c${i}`, indent + 2)))
-
-      return out
-    }
+    return frame(header, summary, ...status, chooser, ...body, footer)
   }).catch(($, e, next) => {
     // A drawing that fails says so in the pane instead of leaving it blank.
     const { Box, Text } = $.ui.resolve(e)
