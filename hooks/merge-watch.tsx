@@ -91,6 +91,8 @@ const moreFailedAtom = atom({ plugin: 'merge-watch', key: 'moreFailed' } as cons
 // Module state. A hot reload starts it over, and the host drops the old module's timers,
 // so a reload never leaves a second timer running.
 let timer: Timer | undefined
+// True once /merge-watch started monitoring in this session; the timer's ticks do nothing until then.
+let isMonitoring = false
 let generation = 0
 let inflight: Promise<void> | null = null
 let inflightGeneration = -1
@@ -444,19 +446,30 @@ async function refresh($: $, isManual: boolean): Promise<void> {
 // ---------------------------------------------------------------------------
 
 /** Fetches now, then every minute. Any earlier timer of this module is cancelled first. */
-function startMonitoring($: $): void {
-  generation += 1
+/**
+ * The once-a-minute timer. Created in session.start, as the mods reference asks for work that
+ * outlives one event: a timer started inside a command's handler did not keep firing. Ticks are
+ * free until monitoring starts. Any earlier timer of this module is cancelled first.
+ */
+function startTimer($: $): void {
   timer?.cancel()
   timer = $.clock.every(REFRESH_MS, () => {
-    void refresh($, false)
+    if (isMonitoring) {
+      void refresh($, false)
+    }
   })
+}
+
+/** Fetches now; the session's timer then refreshes every minute. */
+function startMonitoring($: $): void {
+  generation += 1
+  isMonitoring = true
   void refresh($, true)
 }
 
 function stopMonitoring(): void {
   generation += 1
-  timer?.cancel()
-  timer = undefined
+  isMonitoring = false
 }
 
 /** Opens the pane with the keyboard. Only ever called because someone asked for it. */
@@ -668,8 +681,10 @@ export function registerMergeWatch(on: On, options: PluginOptions): void {
       immediate: true,
     })
 
-    // Nothing else happens until someone runs /merge-watch: no repository lookup, no
-    // refresh, no pane.
+    // The timer starts here but does nothing until someone runs /merge-watch: no repository
+    // lookup, no refresh, no pane before that.
+    startTimer($)
+
     return next(e)
   })
 
@@ -685,6 +700,8 @@ export function registerMergeWatch(on: On, options: PluginOptions): void {
   on('session.end', async ($, e, next) => {
     if (e.reason !== 'clear' && e.reason !== 'resume') {
       stopMonitoring()
+      timer?.cancel()
+      timer = undefined
     }
 
     return next(e)
