@@ -423,6 +423,33 @@ async function copyLink($: $, url: string, surface: 'terminal' | 'desktop' | 'mo
   $.ui.toast(copied.isCopied ? 'Link copied' : `Copy this link: ${url}`)
 }
 
+/** Finds the repository, starts monitoring when it is on, and opens the pane. */
+async function activate($: $, isAsked: boolean): Promise<void> {
+  await resolveRepo($)
+  const view = await read($, viewAtom)
+
+  if (view.phase === 'ready') {
+    startMonitoring($)
+  }
+
+  if (view.phase !== 'off') {
+    await openPane($, isAsked)
+  }
+}
+
+/**
+ * Whether any app can show the pane. The desktop app and other SDK hosts run the session
+ * with isInteractive false and attach their surface separately, so the flag alone is not
+ * enough: a plain `claude -p` run has no surface at all.
+ */
+async function canDisplay($: $, e: { isInteractive: boolean; surface: string | null }): Promise<boolean> {
+  if (e.isInteractive || e.surface !== null) {
+    return true
+  }
+
+  return (await $.session.surfaces()).length > 0
+}
+
 const USAGE =
   'Use /merge-watch to open the panel, or add refresh, hide, off, on or repo (for example /merge-watch refresh).'
 
@@ -445,21 +472,22 @@ export function registerMergeWatch(on: On, options: PluginOptions): void {
       immediate: true,
     })
 
-    if (!e.isInteractive) {
+    if (!(await canDisplay($, e))) {
+      // Nothing can show the pane yet. An app attaching later, or a typed command, wakes it.
       await setView($, v => ({ ...v, phase: 'non-interactive' }))
 
       return next(e)
     }
 
-    await resolveRepo($)
-    const view = await read($, viewAtom)
+    await activate($, false)
 
-    if (view.phase === 'ready') {
-      startMonitoring($)
-    }
+    return next(e)
+  })
 
-    if (view.phase !== 'off') {
-      await openPane($, false)
+  // The desktop app attaches its surface after the session starts.
+  on('session.attach', async ($, e, next) => {
+    if ((await read($, viewAtom)).phase === 'non-interactive') {
+      await activate($, false)
     }
 
     return next(e)
@@ -484,6 +512,12 @@ export function registerMergeWatch(on: On, options: PluginOptions): void {
 
   on('command.run', { command: 'merge-watch' }, async ($, e) => {
     const [action = '', ...rest] = e.args.trim().split(/\s+/).filter(Boolean)
+
+    // Someone typed the command, so something can show the pane.
+    if ((await read($, viewAtom)).phase === 'non-interactive') {
+      await activate($, false)
+    }
+
     const view = await read($, viewAtom)
 
     switch (action.toLowerCase()) {
@@ -595,7 +629,7 @@ export function registerMergeWatch(on: On, options: PluginOptions): void {
     }
 
     if (view.phase === 'non-interactive') {
-      return <Box flexDirection="column" width={width}>{[...header, message('msg', 'Merge Watch does not run in non-interactive sessions.')]}</Box>
+      return <Box flexDirection="column" width={width}>{[...header, message('msg', 'Merge Watch starts when an app that can show this panel is attached.')]}</Box>
     }
 
     if (view.phase === 'starting') {

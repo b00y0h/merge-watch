@@ -22,7 +22,10 @@ type Harness = {
 }
 
 /** Stubs the engine beneath the mod: git, glab, store, clock and the pane calls. */
-function harness(on: On, options: { remotes?: string; cwd?: string; notGit?: boolean; fake?: FakeGitLab } = {}): Harness {
+function harness(
+  on: On,
+  options: { remotes?: string; cwd?: string; notGit?: boolean; fake?: FakeGitLab; surfaces?: ('terminal' | 'desktop')[] } = {},
+): Harness {
   const h: Harness = {
     fake: options.fake ?? fakeGitLab(),
     other: fakeGitLab({ mrs: [glMr(999, { title: 'From the other host', web_url: `https://${OTHER_HOST}/${GL_PATH}/-/merge_requests/999` })] }),
@@ -39,6 +42,8 @@ function harness(on: On, options: { remotes?: string; cwd?: string; notGit?: boo
   on('session.start', (_$, e) => ({ cwd: e.cwd }))
   on('command.register', (_$, e) => ({ value: { command: e.name } }))
   on('session.cwd', () => ({ value: options.cwd ?? '/work/project/nested/dir' }))
+  on('session.surfaces', () => ({ value: options.surfaces ?? [] }))
+  on('session.attach', (_$, e) => ({ clientId: e.clientId }))
   on('store.get', (_$, e) => ({ value: h.store.get(e.key) }))
   on('store.set', (_$, e) => {
     h.store.set(e.key, e.value)
@@ -370,6 +375,37 @@ test('11. expansion choices do not leak between repositories', async ($, on) => 
 
   // The other host's saved collapse does not apply here.
   expect(await jobLink(ui, 1)).toBeDefined()
+})
+
+test('7. the desktop app (an SDK host with a surface) starts monitoring and opens the pane', async ($, on) => {
+  const h = harness(on, { fake: sample(), surfaces: ['desktop'] })
+  await $.session.start({ cwd: '/work/project', surface: null, isInteractive: false })
+  await h.clock.settle()
+
+  expect(h.listCalls()).toBe(1)
+  expect(h.opened).toHaveLength(1)
+})
+
+test('7. a surface attaching after start wakes a headless session', async ($, on) => {
+  const h = harness(on, { fake: sample() })
+  await $.session.start({ cwd: '/work/project', surface: null, isInteractive: false })
+  await h.clock.advance(60_000)
+  expect(h.listCalls()).toBe(0)
+
+  await $.session.attach({ surface: 'desktop', clientId: 'desktop:default' })
+  await h.clock.settle()
+  expect(h.listCalls()).toBe(1)
+  expect(h.opened).toHaveLength(1)
+})
+
+test('7. typing /merge-watch in a session that looked headless starts it', async ($, on) => {
+  const h = harness(on, { fake: sample() })
+  await $.session.start({ cwd: '/work/project', surface: null, isInteractive: false })
+  await command($, '')
+  await h.clock.settle()
+
+  expect(h.listCalls()).toBe(1)
+  expect(h.opened.at(-1)).toEqual({ id: 'merge-watch', title: 'Merge Watch', focus: true })
 })
 
 test('7. non-interactive sessions never poll or open the pane', async ($, on) => {
