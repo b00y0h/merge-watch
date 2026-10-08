@@ -28,7 +28,7 @@ const GLAB_TIMEOUT_MS = 30_000
 const GIT_TIMEOUT_MS = 10_000
 
 const INITIAL_VIEW: MergeWatchView = {
-  phase: 'starting',
+  phase: 'idle',
   repo: null,
   candidates: [],
   isRefreshing: false,
@@ -49,7 +49,6 @@ let inflightGeneration = -1
 let checkout: { top: string; common: string } | null = null
 let hosts: HostConfig = { githubHosts: [], gitlabHosts: [] }
 let githubTokenOption: string | undefined
-let hasToldAboutPlacement = false
 // Mirrors of $.state, so /clear (which resets $.state) can put the pane back as it was.
 let lastView: MergeWatchView = INITIAL_VIEW
 let lastSnapshot: MergeWatchSnapshot | null = null
@@ -382,13 +381,9 @@ function stopMonitoring(): void {
   timer = undefined
 }
 
-async function openPane($: $, isAsked: boolean): Promise<void> {
-  const result = await $.ui.open(isAsked ? { id: PANE_ID, title: 'Merge Watch', focus: true } : { id: PANE_ID, title: 'Merge Watch' })
-
-  if (!result.isPlaced && !isAsked && !hasToldAboutPlacement) {
-    hasToldAboutPlacement = true
-    $.ui.toast('Merge Watch is watching this repository. Type /merge-watch to open its panel.')
-  }
+/** Opens the pane with the keyboard. Only ever called because someone asked for it. */
+async function openPane($: $): Promise<void> {
+  await $.ui.open({ id: PANE_ID, title: 'Merge Watch', focus: true })
 }
 
 async function setEnabled($: $, enabled: boolean): Promise<void> {
@@ -423,32 +418,30 @@ async function copyLink($: $, url: string, surface: 'terminal' | 'desktop' | 'mo
   $.ui.toast(copied.isCopied ? 'Link copied' : `Copy this link: ${url}`)
 }
 
-/** Finds the repository, starts monitoring when it is on, and opens the pane. */
-async function activate($: $, isAsked: boolean): Promise<void> {
+/**
+ * Starts Merge Watch on request: finds the repository, starts the once-a-minute refresh and
+ * opens the pane with the keyboard. Nothing runs before someone asks for it.
+ */
+async function activate($: $): Promise<void> {
   await resolveRepo($)
   const view = await read($, viewAtom)
 
-  if (view.phase === 'ready') {
+  if (view.repo !== null) {
+    await saveCheckoutPrefs($, { enabled: true })
+    await setView($, v => ({ ...v, phase: 'ready' }))
     startMonitoring($)
   }
 
-  if (view.phase !== 'off') {
-    await openPane($, isAsked)
-  }
+  await openPane($)
 }
 
-/**
- * Whether any app can show the pane. The desktop app and other SDK hosts run the session
- * with isInteractive false and attach their surface separately, so the flag alone is not
- * enough: a plain `claude -p` run has no surface at all.
- */
-async function canDisplay($: $, e: { isInteractive: boolean; surface: string | null }): Promise<boolean> {
-  if (e.isInteractive || e.surface !== null) {
-    return true
-  }
-
+/** A plain `claude -p` run has no app attached, so there is nowhere to show the pane. */
+async function hasSurface($: $): Promise<boolean> {
   return (await $.session.surfaces()).length > 0
 }
+
+const NO_SURFACE = 'Merge Watch needs an app that can show its panel, such as the terminal or the desktop app.'
+const NOT_RUNNING = "Merge Watch isn't running in this session. Run /merge-watch to start it."
 
 const USAGE =
   'Use /merge-watch to open the panel, or add refresh, hide, off, on or repo (for example /merge-watch refresh).'
@@ -472,24 +465,8 @@ export function registerMergeWatch(on: On, options: PluginOptions): void {
       immediate: true,
     })
 
-    if (!(await canDisplay($, e))) {
-      // Nothing can show the pane yet. An app attaching later, or a typed command, wakes it.
-      await setView($, v => ({ ...v, phase: 'non-interactive' }))
-
-      return next(e)
-    }
-
-    await activate($, false)
-
-    return next(e)
-  })
-
-  // The desktop app attaches its surface after the session starts.
-  on('session.attach', async ($, e, next) => {
-    if ((await read($, viewAtom)).phase === 'non-interactive') {
-      await activate($, false)
-    }
-
+    // Nothing else happens until someone runs /merge-watch: no repository lookup, no
+    // refresh, no pane.
     return next(e)
   })
 
@@ -513,16 +490,34 @@ export function registerMergeWatch(on: On, options: PluginOptions): void {
   on('command.run', { command: 'merge-watch' }, async ($, e) => {
     const [action = '', ...rest] = e.args.trim().split(/\s+/).filter(Boolean)
 
-    // Someone typed the command, so something can show the pane.
-    if ((await read($, viewAtom)).phase === 'non-interactive') {
-      await activate($, false)
+    const verb = action.toLowerCase()
+    const before = await read($, viewAtom)
+    const isStopped = before.phase === 'idle' || before.phase === 'off'
+
+    // Starting (or restarting) is only ever this command's doing.
+    if (isStopped && (verb === '' || verb === 'on' || verb === 'refresh')) {
+      if (!(await hasSurface($))) {
+        return { text: NO_SURFACE }
+      }
+
+      await activate($)
+
+      return verb === '' ? {} : { text: 'Merge Watch is on.' }
+    }
+
+    if (before.phase === 'idle' && (verb === 'hide' || verb === 'off')) {
+      return { text: NOT_RUNNING }
+    }
+
+    if (before.phase === 'idle' && verb === 'repo') {
+      await resolveRepo($)
     }
 
     const view = await read($, viewAtom)
 
-    switch (action.toLowerCase()) {
+    switch (verb) {
       case '':
-        await openPane($, true)
+        await openPane($)
 
         return {}
       case 'refresh': {
@@ -551,12 +546,7 @@ export function registerMergeWatch(on: On, options: PluginOptions): void {
 
         return { text: 'Merge Watch is off for this repository. Run /merge-watch on to resume.' }
       case 'on':
-        if (view.phase === 'not-git' || view.phase === 'no-remote' || view.phase === 'starting') {
-          await resolveRepo($)
-        }
-
-        await setEnabled($, true)
-        await openPane($, true)
+        await activate($)
 
         return { text: 'Merge Watch is on.' }
       case 'repo': {
@@ -575,7 +565,7 @@ export function registerMergeWatch(on: On, options: PluginOptions): void {
         }
 
         await setView($, v => ({ ...v, isChoosing: true }))
-        await openPane($, true)
+        await openPane($)
         const current = view.repo === null ? 'none selected' : `${view.repo.host}/${view.repo.path} (${view.repo.remoteName})`
 
         return { text: `Watching: ${current}. Pick another in the panel, or run /merge-watch repo <remote>.` }
@@ -628,11 +618,7 @@ export function registerMergeWatch(on: On, options: PluginOptions): void {
       )
     }
 
-    if (view.phase === 'non-interactive') {
-      return <Box flexDirection="column" width={width}>{[...header, message('msg', 'Merge Watch starts when an app that can show this panel is attached.')]}</Box>
-    }
-
-    if (view.phase === 'starting') {
+    if (view.phase === 'idle') {
       return <Box flexDirection="column" width={width}>{[...header, message('msg', 'Finding the repository…')]}</Box>
     }
 

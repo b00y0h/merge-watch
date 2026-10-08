@@ -42,7 +42,7 @@ function harness(
   on('session.start', (_$, e) => ({ cwd: e.cwd }))
   on('command.register', (_$, e) => ({ value: { command: e.name } }))
   on('session.cwd', () => ({ value: options.cwd ?? '/work/project/nested/dir' }))
-  on('session.surfaces', () => ({ value: options.surfaces ?? [] }))
+  on('session.surfaces', () => ({ value: options.surfaces ?? ['terminal'] }))
   on('session.attach', (_$, e) => ({ clientId: e.clientId }))
   on('store.get', (_$, e) => ({ value: h.store.get(e.key) }))
   on('store.set', (_$, e) => {
@@ -128,8 +128,10 @@ function pane(surface: RenderSurface, bodyColumns = 80) {
   }
 }
 
+/** Starts a session, then starts Merge Watch the only way it starts: /merge-watch. */
 async function start($: Engine, h: Harness): Promise<void> {
   await $.session.start({ cwd: '/work/project/nested/dir', surface: 'terminal', isInteractive: true })
+  await command($, '')
   await h.clock.settle()
 }
 
@@ -206,7 +208,7 @@ test('6/7. requests render on terminal and desktop; titles and jobs link to thei
     await ui.unmount()
   }
 
-  expect(h.opened[0]).toEqual({ id: 'merge-watch', title: 'Merge Watch' })
+  expect(h.opened[0]).toEqual({ id: 'merge-watch', title: 'Merge Watch', focus: true })
 })
 
 test('7. narrow panes and long lists keep every request reachable', async ($, on) => {
@@ -282,6 +284,9 @@ test('9/11. a late answer for the previous repository is discarded after switchi
   const h = harness(on, { fake: sample(), remotes: REMOTES_TWO })
   h.slow.list = 5_000
   await $.session.start({ cwd: '/work/project', surface: 'terminal', isInteractive: true })
+  await command($, '')
+  await h.clock.settle()
+  expect(h.listCalls()).toBe(1)
 
   expect(await command($, 'repo upstream')).toBe(`Merge Watch now watches ${OTHER_HOST}/${GL_PATH}.`)
   h.slow.list = 0
@@ -293,7 +298,7 @@ test('9/11. a late answer for the previous repository is discarded after switchi
 
   expect(labels).toContain('!999 From the other host')
   expect(labels.some(l => l.includes('pricing'))).toBe(false)
-  expect(h.store.get('checkout:/work/project/.git')).toEqual({ selection: `gitlab:${OTHER_HOST}/${GL_PATH}` })
+  expect(h.store.get('checkout:/work/project/.git')).toMatchObject({ selection: `gitlab:${OTHER_HOST}/${GL_PATH}` })
 })
 
 test('1. ambiguous remotes show a selector instead of guessing', async ($, on) => {
@@ -377,39 +382,49 @@ test('11. expansion choices do not leak between repositories', async ($, on) => 
   expect(await jobLink(ui, 1)).toBeDefined()
 })
 
-test('7. the desktop app (an SDK host with a surface) starts monitoring and opens the pane', async ($, on) => {
+test('starting a session does nothing until /merge-watch is run', async ($, on) => {
+  const h = harness(on, { fake: sample(), surfaces: ['desktop'] })
+  await $.session.start({ cwd: '/work/project', surface: 'terminal', isInteractive: true })
+  await h.clock.advance(180_000)
+
+  expect(h.listCalls()).toBe(0)
+  expect(h.opened).toHaveLength(0)
+})
+
+test('7. in the desktop app (isInteractive false, surface attached) /merge-watch starts it', async ($, on) => {
   const h = harness(on, { fake: sample(), surfaces: ['desktop'] })
   await $.session.start({ cwd: '/work/project', surface: null, isInteractive: false })
-  await h.clock.settle()
-
-  expect(h.listCalls()).toBe(1)
-  expect(h.opened).toHaveLength(1)
-})
-
-test('7. a surface attaching after start wakes a headless session', async ($, on) => {
-  const h = harness(on, { fake: sample() })
-  await $.session.start({ cwd: '/work/project', surface: null, isInteractive: false })
-  await h.clock.advance(60_000)
   expect(h.listCalls()).toBe(0)
 
-  await $.session.attach({ surface: 'desktop', clientId: 'desktop:default' })
-  await h.clock.settle()
-  expect(h.listCalls()).toBe(1)
-  expect(h.opened).toHaveLength(1)
-})
-
-test('7. typing /merge-watch in a session that looked headless starts it', async ($, on) => {
-  const h = harness(on, { fake: sample() })
-  await $.session.start({ cwd: '/work/project', surface: null, isInteractive: false })
   await command($, '')
   await h.clock.settle()
-
   expect(h.listCalls()).toBe(1)
-  expect(h.opened.at(-1)).toEqual({ id: 'merge-watch', title: 'Merge Watch', focus: true })
+  expect(h.opened).toEqual([{ id: 'merge-watch', title: 'Merge Watch', focus: true }])
+  await h.clock.advance(60_000)
+  expect(h.listCalls()).toBe(2)
+})
+
+test('7. with no app attached (claude -p) the command explains instead of polling', async ($, on) => {
+  const h = harness(on, { fake: sample(), surfaces: [] })
+  await $.session.start({ cwd: '/work/project', surface: null, isInteractive: false })
+
+  expect(await command($, '')).toContain('needs an app that can show its panel')
+  await h.clock.advance(120_000)
+  expect(h.listCalls()).toBe(0)
+  expect(h.opened).toHaveLength(0)
+})
+
+test('hide and off before starting say it is not running', async ($, on) => {
+  const h = harness(on, { fake: sample() })
+  await $.session.start({ cwd: '/work/project', surface: 'terminal', isInteractive: true })
+
+  expect(await command($, 'hide')).toContain("isn't running")
+  expect(await command($, 'off')).toContain("isn't running")
+  expect(h.listCalls()).toBe(0)
 })
 
 test('7. non-interactive sessions never poll or open the pane', async ($, on) => {
-  const h = harness(on, { fake: sample() })
+  const h = harness(on, { fake: sample(), surfaces: [] })
   await $.session.start({ cwd: '/work/project', surface: null, isInteractive: false })
   await h.clock.advance(120_000)
 

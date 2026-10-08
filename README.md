@@ -52,7 +52,8 @@ claude plugin marketplace add b00y0h/merge-watch --scope local
 claude plugin install merge-watch@merge-watch --scope local
 ```
 
-Restart Claude Code, or run `/reload-plugins`, to load it.
+Restart Claude Code, or run `/reload-plugins`, to load it. Merge Watch does nothing until you run
+`/merge-watch`: no panel opens and nothing is fetched when a session starts.
 
 ## Sign-in
 
@@ -78,11 +79,11 @@ Never paste a token into the chat or a project file. A GitLab sign-in cannot be 
 
 | Command | What it does |
 |---|---|
-| `/merge-watch` | Open the panel and give it the keyboard |
+| `/merge-watch` | Start watching this repository and open the panel. Run it again to bring the panel back |
 | `/merge-watch refresh` | Refresh now. A refresh already running is joined, not repeated |
 | `/merge-watch hide` | Close the panel, keep refreshing in the background |
 | `/merge-watch off` | Close the panel and stop refreshing for this repository |
-| `/merge-watch on` | Resume, refresh at once and open the panel |
+| `/merge-watch on` | Same as `/merge-watch`: start (or resume), refresh at once and open the panel |
 | `/merge-watch repo` | Show which repository is watched and pick another remote |
 | `/merge-watch repo <remote>` | Watch the remote with that name, e.g. `upstream` |
 
@@ -99,8 +100,8 @@ github.com and gitlab.com are recognised, as is any host with `gitlab.` in its n
 the plugin options: `github_hosts` for GitHub Enterprise, `gitlab_hosts` for self-hosted GitLab.
 
 Preferences are stored per repository, keyed by provider, host and full project path, so two projects
-with the same name on different hosts never share settings. Whether monitoring is on, and which remote
-you picked, are stored per checkout and survive restarts.
+with the same name on different hosts never share settings. The remote you picked is stored per
+checkout and survives restarts.
 
 ## Troubleshooting
 
@@ -113,9 +114,10 @@ you picked, are stored per checkout and survive restarts.
   waits until then before asking again, and keeps showing the last data.
 - **"Previous revision"** The newest pipeline ran for an older commit. Push or re-run CI in GitLab
   or GitHub; Merge Watch never triggers pipelines itself.
-- **The panel does not appear by itself** In a narrow terminal Claude Code holds back panels that open
-  on their own. Type `/merge-watch`, or widen the terminal.
-- **Nothing happens in `claude -p`** Merge Watch does not poll in non-interactive sessions.
+- **The panel never appears on its own** That is by design. Run `/merge-watch` in each session where you
+  want it.
+- **`claude -p` answers that Merge Watch needs an app** A headless run has nowhere to show the panel, so
+  Merge Watch does not start there.
 
 To see why a mod did nothing, start Claude Code with `claude --debug` and look for lines that mention
 `merge-watch`.

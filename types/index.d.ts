@@ -101,13 +101,12 @@ export type MergeWatchSnapshot = {
 }
 
 export type MergeWatchPhase =
-  | 'starting'
+  | 'idle'
   | 'not-git'
   | 'no-remote'
   | 'choose-repo'
   | 'ready'
   | 'off'
-  | 'non-interactive'
 
 export type MergeWatchView = {
   phase: MergeWatchPhase
